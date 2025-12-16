@@ -1,13 +1,14 @@
-
-include AUTHORS.rst
-
-include CONTRIBUTING.rst
-include HISTORY.rst
 include LICENSE
-include README.rst
+include README.md
+include sim2l/version.py
 
-recursive-include tests *
+# Include schema files
+recursive-include sim2l/repository *.sql
+
+# Include tests
+recursive-include tests *.py
+
+# Exclude unnecessary files
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
-
-recursive-include docs *.rst conf.py Makefile make.bat *.jpg *.png *.gif
+recursive-exclude * .DS_Store
