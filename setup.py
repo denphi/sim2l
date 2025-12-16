@@ -1,51 +1,78 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+"""Setup configuration for sim2l package"""
 
-from setuptools import setup
+from setuptools import setup, find_packages
+from pathlib import Path
 
-with open('README.rst') as readme_file:
-    readme = readme_file.read()
+# Read README
+readme_file = Path(__file__).parent / "README.md"
+long_description = readme_file.read_text() if readme_file.exists() else ""
 
-with open('HISTORY.rst') as history_file:
-    history = history_file.read()
-
-requirements = ['ipython', 'pint', 'numpy', 'papermill', 'jsonpickle', 
-                'mendeleev', 'pillow', 'nteract-scrapbook', 'joblib']
-
-test_requirements = [
-    # TODO: put package test requirements here
-]
+# Read version
+version_file = Path(__file__).parent / "sim2l" / "version.py"
+version = {}
+exec(version_file.read_text(), version)
 
 setup(
-    name='simtool',
-    version='0.1.6',
-    description="Functions for creating and running Simulation Tools",
-    long_description=readme + '\n\n' + history,
-    author="Martin Hunt",
-    author_email='mmh@purdue.edu',
-    url='https://github.com/hubzero/simtool',
-    packages=[
-        'simtool',
+    name="sim2l",
+    version=version["__version__"],
+    description="Simulation framework with database-backed persistence",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    author="sim2l Development Team",
+    author_email="sim2l@example.com",
+    url="https://github.com/your-org/sim2l",
+    packages=find_packages(exclude=["tests", "tests.*"]),
+    python_requires=">=3.8",
+    install_requires=[
+        "numpy>=1.20",
+        "pint>=0.20",
+        "pyyaml>=5.4",
+        "papermill>=2.3",
+        "jsonpickle>=2.0",
+        "pillow>=8.0",
+        "mendeleev>=0.9",
+        "ipython>=7.0",
+        "click>=8.0",
+        "tabulate>=0.8",
+        # Database services
+        "flask>=2.0",
+        "requests>=2.25",
+        "psycopg2-binary>=2.9",
     ],
-    package_dir={'simtool':
-                 'simtool'},
-    include_package_data=True,
-    install_requires=requirements,
-    license="MIT license",
-    zip_safe=False,
-    keywords='simtool',
+    extras_require={
+        "dev": [
+            "pytest>=7.0",
+            "pytest-cov>=3.0",
+            "black>=22.0",
+            "flake8>=4.0",
+            "mypy>=0.950",
+        ],
+        "docs": [
+            "sphinx>=4.0",
+            "sphinx-rtd-theme>=1.0",
+        ],
+        "notebooks": [
+            "scrapbook>=0.5",  # For notebook-based simulations
+        ],
+    },
+    entry_points={
+        "console_scripts": [
+            "sim2l=sim2l.cli.main:cli",
+        ],
+    },
     classifiers=[
-        'Development Status :: 2 - Pre-Alpha',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
-        'Natural Language :: English',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Topic :: Scientific/Engineering",
     ],
-    test_suite='tests',
-    tests_require=test_requirements
+    include_package_data=True,
+    package_data={
+        "sim2l": ["repository/schema.sql"],
+    },
 )

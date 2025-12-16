@@ -6,6 +6,9 @@ papermill
 jsonpickle
 mendeleev
 pillow
-nteract-scrapbook
 joblib
 nbsphinx
+# Database services dependencies
+flask
+requests
+psycopg2-binary

@@ -64,3 +64,4 @@ target/
 # IPython Notebook
 .ipynb_checkpoints
 
+.claude/

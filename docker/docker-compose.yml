@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for production deployments
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: sim2l
+      POSTGRES_PASSWORD: sim2l_password
+      POSTGRES_DB: sim2l
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sim2l"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Cache service (SQLite mode - for development)
+  cache-sqlite:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cache
+    environment:
+      BACKEND: sqlite
+      DB_PATH: /data/cache.db
+      HOST: 0.0.0.0
+      PORT: 8001
+    volumes:
+      - cache_data:/data
+    ports:
+      - "8001:8001"
+    profiles:
+      - sqlite
+      - dev
+
+  # Cache service (PostgreSQL mode - for production)
+  cache-postgres:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cache
+    environment:
+      BACKEND: postgresql
+      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_cache
+      HOST: 0.0.0.0
+      PORT: 8001
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - postgresql
+      - prod
+
+  # Catalog service (SQLite mode - for development)
+  catalog-sqlite:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.catalog
+    environment:
+      BACKEND: sqlite
+      DB_PATH: /data/catalog.db
+      HOST: 0.0.0.0
+      PORT: 8002
+    volumes:
+      - catalog_data:/data
+    ports:
+      - "8002:8002"
+    profiles:
+      - sqlite
+      - dev
+
+  # Catalog service (PostgreSQL mode - for production)
+  catalog-postgres:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.catalog
+    environment:
+      BACKEND: postgresql
+      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_catalog
+      HOST: 0.0.0.0
+      PORT: 8002
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - postgresql
+      - prod
+
+volumes:
+  postgres_data:
+  cache_data:
+  catalog_data:

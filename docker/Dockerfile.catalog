@@ -1,0 +1,31 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+RUN pip install --no-cache-dir \
+    flask \
+    requests \
+    psycopg2-binary
+
+# Copy sim2l package
+COPY sim2l /app/sim2l
+
+# Expose port
+EXPOSE 8002
+
+# Default to SQLite backend
+ENV BACKEND=sqlite
+ENV DB_PATH=/data/catalog.db
+ENV HOST=0.0.0.0
+ENV PORT=8002
+
+# Create data directory
+RUN mkdir -p /data
+
+# Run catalog service
+CMD python -m sim2l.services.catalog_service \
+    --backend ${BACKEND} \
+    --db-path ${DB_PATH} \
+    --host ${HOST} \
+    --port ${PORT}
