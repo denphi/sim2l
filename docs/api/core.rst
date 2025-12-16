@@ -19,4 +19,4 @@ Configuration
 Loading Simulations
 --------------------
 
-.. autofunction:: sim2l.load
+.. autofunction:: sim2l.load_simulation
