@@ -1,0 +1,20 @@
+# Requirements for building documentation on Read the Docs
+
+# Sphinx and theme
+sphinx>=4.0
+sphinx-rtd-theme>=1.0
+sphinx-autodoc-typehints>=1.12
+
+# For better documentation
+sphinxcontrib-napoleon>=0.7
+nbsphinx>=0.8
+
+# Sim2l dependencies needed for autodoc
+pyyaml>=5.4
+pint>=0.20
+numpy>=1.20
+flask>=2.0
+requests>=2.25
+
+# Optional: for code examples in docs
+ipython>=7.0
