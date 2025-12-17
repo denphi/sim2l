@@ -354,85 +354,193 @@ class NotebookExecutor(Executor):
             inputs: Input parameters
         """
         try:
-            import sqlite3
-            import json
+            from ..config import get_config
+            config = get_config()
 
-            # Get results database path
-            results_db_path = Path.home() / ".sim2l" / "results.db"
-
-            if not results_db_path.exists():
-                logger.debug("Results database not found, skipping registration")
-                return
-
-            # Convert outputs to serializable format (handle Pint quantities and numpy arrays)
-            def to_value(val):
-                """Extract numeric value from Pint quantity, numpy array, or return as-is"""
-                import numpy as np
-
-                # Handle Pint quantities
-                if hasattr(val, 'magnitude'):
-                    val = val.magnitude
-
-                # Handle numpy arrays
-                if isinstance(val, np.ndarray):
-                    return val.tolist()
-
-                # Handle numpy scalars
-                if isinstance(val, (np.integer, np.floating)):
-                    return val.item()
-
-                # Handle regular numbers
-                if isinstance(val, (int, float)):
-                    return float(val)
-
-                # Handle strings and booleans
-                if isinstance(val, (str, bool)):
-                    return val
-
-                # For anything else, try to convert to string
-                return str(val)
-
-            # Serialize outputs
-            outputs_dict = {}
-            if result.outputs:
-                # Use to_dict() to get the raw output data
-                for key, value in result.outputs.to_dict().items():
-                    outputs_dict[key] = to_value(value)
-
-            # Serialize inputs
-            inputs_dict = {}
-            for key, value in inputs.items():
-                inputs_dict[key] = to_value(value)
-
-            # Insert into results database
-            conn = sqlite3.connect(str(results_db_path))
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                INSERT OR REPLACE INTO execution_results (
-                    execution_id, simulation_name, simulation_version, squid_id,
-                    input_params, output_params, status, duration_seconds,
-                    run_db_path, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            """, (
-                result.squid_id,
-                simulation.name,
-                simulation.version,
-                result.squid_id,
-                json.dumps(inputs_dict),
-                json.dumps(outputs_dict),
-                result.status,
-                result.duration_seconds,
-                ''  # No run database in notebook executor
-            ))
-
-            conn.commit()
-            conn.close()
-
-            logger.debug(f"Registered result {result.squid_id[:40]}... with results service")
+            # Check if results service is configured
+            if hasattr(config, 'results_service_url') and config.results_service_url:
+                # Use results service API
+                self._register_result_via_api(result, simulation, inputs)
+            else:
+                # Fall back to local SQLite registration
+                self._register_result_local(result, simulation, inputs)
 
         except Exception as e:
             logger.warning(f"Failed to register result with results service: {e}")
+
+    def _register_result_via_api(
+        self,
+        result: ExecutionResult,
+        simulation: SimulationDefinition,
+        inputs: Dict[str, Any]
+    ):
+        """Register result via results service API
+
+        Args:
+            result: Execution result to register
+            simulation: Simulation definition
+            inputs: Input parameters
+        """
+        import requests
+        import json
+        from ..config import get_config
+
+        config = get_config()
+
+        # Convert outputs to serializable format
+        def to_value(val):
+            """Extract numeric value from Pint quantity, numpy array, or return as-is"""
+            import numpy as np
+
+            # Handle Pint quantities
+            if hasattr(val, 'magnitude'):
+                val = val.magnitude
+
+            # Handle numpy arrays
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+
+            # Handle numpy scalars
+            if isinstance(val, (np.integer, np.floating)):
+                return val.item()
+
+            # Handle regular numbers
+            if isinstance(val, (int, float)):
+                return float(val)
+
+            # Handle strings and booleans
+            if isinstance(val, (str, bool)):
+                return val
+
+            # For anything else, try to convert to string
+            return str(val)
+
+        # Serialize outputs
+        outputs_dict = {}
+        if result.outputs:
+            for key, value in result.outputs.to_dict().items():
+                outputs_dict[key] = to_value(value)
+
+        # Serialize inputs
+        inputs_dict = {}
+        for key, value in inputs.items():
+            inputs_dict[key] = to_value(value)
+
+        # Call results service API directly with parameters
+        # Since NotebookExecutor doesn't use RunDatabase, we can't use the /register endpoint
+        # Instead, we'll call the backend's register_result method directly via a new endpoint
+        # For now, we'll use direct HTTP to the results service
+
+        response = requests.post(
+            f"{config.results_service_url.rstrip('/')}/register_direct",
+            json={
+                'execution_id': result.execution_id,
+                'simulation_name': simulation.name,
+                'simulation_version': simulation.version,
+                'squid_id': result.squid_id,
+                'input_params': inputs_dict,
+                'output_params': outputs_dict,
+                'status': result.status,
+                'duration_seconds': result.duration_seconds,
+                'run_db_path': ''
+            },
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            logger.debug(f"Registered result {result.squid_id[:40]}... via API")
+        else:
+            logger.warning(f"Failed to register result via API: {response.status_code} {response.text}")
+
+    def _register_result_local(
+        self,
+        result: ExecutionResult,
+        simulation: SimulationDefinition,
+        inputs: Dict[str, Any]
+    ):
+        """Register result to local SQLite database
+
+        Args:
+            result: Execution result to register
+            simulation: Simulation definition
+            inputs: Input parameters
+        """
+        import sqlite3
+        import json
+
+        # Get results database path
+        results_db_path = Path.home() / ".sim2l" / "results.db"
+
+        if not results_db_path.exists():
+            logger.debug("Results database not found, skipping registration")
+            return
+
+        # Convert outputs to serializable format
+        def to_value(val):
+            """Extract numeric value from Pint quantity, numpy array, or return as-is"""
+            import numpy as np
+
+            # Handle Pint quantities
+            if hasattr(val, 'magnitude'):
+                val = val.magnitude
+
+            # Handle numpy arrays
+            if isinstance(val, np.ndarray):
+                return val.tolist()
+
+            # Handle numpy scalars
+            if isinstance(val, (np.integer, np.floating)):
+                return val.item()
+
+            # Handle regular numbers
+            if isinstance(val, (int, float)):
+                return float(val)
+
+            # Handle strings and booleans
+            if isinstance(val, (str, bool)):
+                return val
+
+            # For anything else, try to convert to string
+            return str(val)
+
+        # Serialize outputs
+        outputs_dict = {}
+        if result.outputs:
+            for key, value in result.outputs.to_dict().items():
+                outputs_dict[key] = to_value(value)
+
+        # Serialize inputs
+        inputs_dict = {}
+        for key, value in inputs.items():
+            inputs_dict[key] = to_value(value)
+
+        # Insert into results database
+        conn = sqlite3.connect(str(results_db_path))
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO execution_results (
+                execution_id, simulation_name, simulation_version, squid_id,
+                input_params, output_params, status, duration_seconds,
+                run_db_path, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        """, (
+            result.squid_id,
+            simulation.name,
+            simulation.version,
+            result.squid_id,
+            json.dumps(inputs_dict),
+            json.dumps(outputs_dict),
+            result.status,
+            result.duration_seconds,
+            ''  # No run database in notebook executor
+        ))
+
+        conn.commit()
+        conn.close()
+
+        logger.debug(f"Registered result {result.squid_id[:40]}... to local database")
 
     def __repr__(self):
         return f"NotebookExecutor(cache={self.cache}, copy_files={self.copy_files}, register_results={self.register_results})"

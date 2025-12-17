@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: sim2l_postgres
+    environment:
+      POSTGRES_USER: sim2l
+      POSTGRES_PASSWORD: sim2l_dev_password
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Mount initialization scripts
+      - ./init_postgres.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      - ../sim2l/database:/schemas:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sim2l"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local

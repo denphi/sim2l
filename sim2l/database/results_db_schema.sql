@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS simulation_schemas (
     UNIQUE(tool_name, tool_version)
 );
 
-CREATE INDEX idx_simulation_schemas_tool ON simulation_schemas(tool_name);
-CREATE INDEX idx_simulation_schemas_version ON simulation_schemas(tool_name, tool_version);
+CREATE INDEX IF NOT EXISTS idx_simulation_schemas_tool ON simulation_schemas(tool_name);
+CREATE INDEX IF NOT EXISTS idx_simulation_schemas_version ON simulation_schemas(tool_name, tool_version);
 
 COMMENT ON TABLE simulation_schemas IS 'Stores parameter schemas for simulation tools';
 COMMENT ON COLUMN simulation_schemas.schema_data IS 'JSON schema with input/output parameter definitions';
@@ -52,15 +52,15 @@ CREATE TABLE IF NOT EXISTS execution_results (
     metadata JSONB  -- Additional execution metadata
 );
 
-CREATE INDEX idx_execution_results_exec_id ON execution_results(execution_id);
-CREATE INDEX idx_execution_results_simulation ON execution_results(simulation_name, simulation_version);
-CREATE INDEX idx_execution_results_squid ON execution_results(squid_id);
-CREATE INDEX idx_execution_results_status ON execution_results(status);
-CREATE INDEX idx_execution_results_schema ON execution_results(schema_id);
+CREATE INDEX IF NOT EXISTS idx_execution_results_exec_id ON execution_results(execution_id);
+CREATE INDEX IF NOT EXISTS idx_execution_results_simulation ON execution_results(simulation_name, simulation_version);
+CREATE INDEX IF NOT EXISTS idx_execution_results_squid ON execution_results(squid_id);
+CREATE INDEX IF NOT EXISTS idx_execution_results_status ON execution_results(status);
+CREATE INDEX IF NOT EXISTS idx_execution_results_schema ON execution_results(schema_id);
 
 -- GIN indexes for JSONB parameter searching
-CREATE INDEX idx_execution_results_input_params ON execution_results USING GIN (input_params);
-CREATE INDEX idx_execution_results_output_params ON execution_results USING GIN (output_params);
+CREATE INDEX IF NOT EXISTS idx_execution_results_input_params ON execution_results USING GIN (input_params);
+CREATE INDEX IF NOT EXISTS idx_execution_results_output_params ON execution_results USING GIN (output_params);
 
 COMMENT ON TABLE execution_results IS 'Stores execution results with searchable parameters';
 COMMENT ON COLUMN execution_results.input_params IS 'JSON object with input parameter values';
@@ -88,13 +88,13 @@ CREATE TABLE IF NOT EXISTS parameter_definitions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_parameter_definitions_schema ON parameter_definitions(schema_id);
-CREATE INDEX idx_parameter_definitions_name ON parameter_definitions(param_name);
-CREATE INDEX idx_parameter_definitions_type ON parameter_definitions(param_type);
-CREATE INDEX idx_parameter_definitions_class ON parameter_definitions(classification);
+CREATE INDEX IF NOT EXISTS idx_parameter_definitions_schema ON parameter_definitions(schema_id);
+CREATE INDEX IF NOT EXISTS idx_parameter_definitions_name ON parameter_definitions(param_name);
+CREATE INDEX IF NOT EXISTS idx_parameter_definitions_type ON parameter_definitions(param_type);
+CREATE INDEX IF NOT EXISTS idx_parameter_definitions_class ON parameter_definitions(classification);
 
 -- Full-text search on descriptions
-CREATE INDEX idx_parameter_definitions_desc_fts ON parameter_definitions USING GIN (to_tsvector('english', description));
+CREATE INDEX IF NOT EXISTS idx_parameter_definitions_desc_fts ON parameter_definitions USING GIN (to_tsvector('english', description));
 
 COMMENT ON TABLE parameter_definitions IS 'Detailed metadata for simulation parameters';
 
@@ -114,8 +114,8 @@ CREATE TABLE IF NOT EXISTS result_errors (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_result_errors_exec_id ON result_errors(execution_id);
-CREATE INDEX idx_result_errors_simulation ON result_errors(simulation_name);
+CREATE INDEX IF NOT EXISTS idx_result_errors_exec_id ON result_errors(execution_id);
+CREATE INDEX IF NOT EXISTS idx_result_errors_simulation ON result_errors(simulation_name);
 
 COMMENT ON TABLE result_errors IS 'Tracks errors during result registration';
 
@@ -135,8 +135,8 @@ CREATE TABLE IF NOT EXISTS result_search_cache (
     access_count INTEGER DEFAULT 1
 );
 
-CREATE INDEX idx_result_search_cache_hash ON result_search_cache(query_hash);
-CREATE INDEX idx_result_search_cache_accessed ON result_search_cache(accessed_at);
+CREATE INDEX IF NOT EXISTS idx_result_search_cache_hash ON result_search_cache(query_hash);
+CREATE INDEX IF NOT EXISTS idx_result_search_cache_accessed ON result_search_cache(accessed_at);
 
 COMMENT ON TABLE result_search_cache IS 'Caches search results for performance';
 

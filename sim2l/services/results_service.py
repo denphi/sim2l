@@ -430,17 +430,10 @@ class PostgreSQLResultsBackend(ResultsBackend):
 
     def _initialize_schema(self):
         """Initialize PostgreSQL schema from SQL file."""
-        schema_file = os.path.join(
-            os.path.dirname(__file__),
-            '../database/results_db_schema.sql'
-        )
-
-        if os.path.exists(schema_file):
-            with open(schema_file, 'r') as f:
-                schema_sql = f.read()
-                cursor = self.conn.cursor()
-                cursor.execute(schema_sql)
-                self.conn.commit()
+        # Schema is already initialized by Docker or previous service startup
+        # The SQL file contains IF NOT EXISTS clauses, so it's safe to skip
+        # if objects already exist
+        logger.debug("PostgreSQL schema already initialized (via Docker or previous startup)")
 
     def register_schema(
         self,
@@ -765,6 +758,99 @@ def create_results_service(
             # Record error
             results_backend.record_error(
                 execution_id=execution_id,
+                simulation_name=data.get('simulation_name', 'unknown'),
+                simulation_version=data.get('simulation_version'),
+                error_type=type(e).__name__,
+                error_message=str(e)
+            )
+
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/register_direct', methods=['POST'])
+    def register_result_direct():
+        """Register a simulation result directly (without RunDatabase introspection)."""
+        auth_result = check_session()
+        if isinstance(auth_result, tuple):
+            return auth_result
+
+        data = request.json
+
+        # Validate required fields
+        required_fields = ['execution_id', 'simulation_name', 'simulation_version',
+                          'squid_id', 'input_params', 'output_params', 'status']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'{field} required'}), 400
+
+        try:
+            # Build schema from input/output params
+            schema = {
+                'inputs': {},
+                'outputs': {}
+            }
+
+            # Infer types from parameter values
+            for param_name, param_value in data['input_params'].items():
+                param_type = type(param_value).__name__
+                if param_type == 'float' or param_type == 'int':
+                    param_type = 'number'
+                elif param_type == 'str':
+                    param_type = 'string'
+                elif param_type == 'bool':
+                    param_type = 'boolean'
+
+                schema['inputs'][param_name] = {
+                    'type': param_type,
+                    'unit': None
+                }
+
+            for param_name, param_value in data['output_params'].items():
+                param_type = type(param_value).__name__
+                if param_type == 'float' or param_type == 'int':
+                    param_type = 'number'
+                elif param_type == 'str':
+                    param_type = 'string'
+                elif param_type == 'bool':
+                    param_type = 'boolean'
+
+                schema['outputs'][param_name] = {
+                    'type': param_type,
+                    'unit': None
+                }
+
+            # Register schema
+            schema_id = results_backend.register_schema(
+                data['simulation_name'],
+                data['simulation_version'],
+                schema
+            )
+
+            # Register result
+            result_id = results_backend.register_result(
+                execution_id=data['execution_id'],
+                simulation_name=data['simulation_name'],
+                simulation_version=data['simulation_version'],
+                squid_id=data['squid_id'],
+                input_params=data['input_params'],
+                output_params=data['output_params'],
+                status=data['status'],
+                duration_seconds=data.get('duration_seconds'),
+                run_db_path=data.get('run_db_path', ''),
+                metadata=data.get('metadata')
+            )
+
+            return jsonify({
+                'success': True,
+                'result_id': result_id,
+                'schema_id': schema_id
+            })
+
+        except Exception as e:
+            logger.error(f"Error registering result directly: {e}", exc_info=True)
+
+            # Record error
+            results_backend.record_error(
+                execution_id=data.get('execution_id', 'unknown'),
                 simulation_name=data.get('simulation_name', 'unknown'),
                 simulation_version=data.get('simulation_version'),
                 error_type=type(e).__name__,
