@@ -25,6 +25,7 @@ app = Flask(__name__)
 
 # Database backend (will be initialized in main)
 cache_db = None
+require_auth = True  # Set to False with --no-auth flag
 
 
 class CacheServiceBackend:
@@ -68,27 +69,54 @@ class SQLiteCacheBackend(CacheServiceBackend):
         with open(schema_path, "r") as f:
             schema_sql = f.read()
 
-        # Simple adaptations for SQLite
-        schema_sql = schema_sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+        # Simple adaptations for SQLite (order matters!)
+        # Do BIGSERIAL before BIGINT to avoid double replacement
         schema_sql = schema_sql.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-        schema_sql = schema_sql.replace("JSONB", "TEXT")
-        schema_sql = schema_sql.replace("IF NOT EXISTS", "")
+        schema_sql = schema_sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
         schema_sql = schema_sql.replace("BIGINT", "INTEGER")
+        schema_sql = schema_sql.replace("JSONB", "TEXT")
+        schema_sql = schema_sql.replace("BOOLEAN", "INTEGER")
+        schema_sql = schema_sql.replace("DEFAULT true", "DEFAULT 1")
+        schema_sql = schema_sql.replace("DEFAULT false", "DEFAULT 0")
+        # Keep "IF NOT EXISTS" for tables, but we'll add it back after filtering
+        schema_sql = schema_sql.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
 
         # Remove PostgreSQL-specific functions and views
         lines = schema_sql.split("\n")
         filtered_lines = []
         skip_until_end = False
+        paren_depth = 0
 
         for line in lines:
+            stripped = line.strip()
+
+            # Start skipping when we encounter a function or view
             if "CREATE OR REPLACE FUNCTION" in line or "CREATE OR REPLACE VIEW" in line:
                 skip_until_end = True
-            elif skip_until_end and line.startswith("--"):
-                skip_until_end = False
-            elif not skip_until_end:
+                paren_depth = 0
+
+            if skip_until_end:
+                # Track parentheses and $$ delimiters for function bodies
+                if "$$" in line:
+                    # Toggle function body delimiter
+                    if paren_depth == 0:
+                        paren_depth = 1
+                    else:
+                        paren_depth = 0
+                        skip_until_end = False
+                elif line.endswith(";") and paren_depth == 0:
+                    # End of statement
+                    skip_until_end = False
+                continue
+
+            # Keep all other lines
+            if stripped and not skip_until_end:
                 filtered_lines.append(line)
 
         schema_sql = "\n".join(filtered_lines)
+
+        # Add IF NOT EXISTS back to CREATE TABLE statements
+        schema_sql = schema_sql.replace("CREATE TABLE cache_", "CREATE TABLE IF NOT EXISTS cache_")
 
         # Execute schema
         try:
@@ -418,10 +446,10 @@ def health():
     return jsonify(data), status
 
 
-@app.route("/cache/<cache_key>", methods=["GET"])
+@app.route("/cache/<path:cache_key>", methods=["GET"])
 def get_cache(cache_key):
-    session_id = request.headers.get("X-Session-ID")
-    if not session_id:
+    session_id = request.headers.get("X-Session-ID", "demo-session")
+    if require_auth and not session_id:
         return jsonify({"error": "Missing session ID"}), 401
 
     data, status = cache_db.get(cache_key, session_id)
@@ -433,8 +461,8 @@ def get_cache(cache_key):
 
 @app.route("/cache", methods=["POST"])
 def set_cache():
-    session_id = request.headers.get("X-Session-ID")
-    if not session_id:
+    session_id = request.headers.get("X-Session-ID", "demo-session")
+    if require_auth and not session_id:
         return jsonify({"error": "Missing session ID"}), 401
 
     data = request.json
@@ -478,15 +506,37 @@ def main():
     parser.add_argument(
         "--db-url", help="PostgreSQL connection string (for postgresql backend)"
     )
+    parser.add_argument(
+        "--no-auth", action="store_true", help="Disable authentication (demo mode)"
+    )
 
     args = parser.parse_args()
 
     global cache_db
+    global require_auth
+    require_auth = not args.no_auth
 
     # Initialize backend
     if args.backend == "sqlite":
         cache_db = SQLiteCacheBackend(args.db_path)
         logger.info(f"Using SQLite backend: {args.db_path}")
+
+        # Create a demo session that never expires when --no-auth is used
+        if not require_auth:
+            import sqlite3
+            from datetime import datetime, timedelta
+            conn = sqlite3.connect(args.db_path)
+            cursor = conn.cursor()
+            # Create session that expires in 100 years (effectively never)
+            expires_at = (datetime.now() + timedelta(days=36500)).isoformat()
+            cursor.execute("""
+                INSERT OR REPLACE INTO cache_sessions (session_id, user_id, expires_at, access_level, is_valid)
+                VALUES (?, ?, ?, ?, ?)
+            """, ("demo-session", 1, expires_at, 'write', 1))
+            conn.commit()
+            conn.close()
+            logger.info("Created demo session for no-auth mode")
+
     elif args.backend == "postgresql":
         if not args.db_url:
             logger.error("PostgreSQL backend requires --db-url")
@@ -496,6 +546,8 @@ def main():
 
     # Start server
     logger.info(f"Starting cache service on {args.host}:{args.port}")
+    if not require_auth:
+        logger.info("Authentication disabled (--no-auth mode)")
     app.run(host=args.host, port=args.port, debug=False)
 
 

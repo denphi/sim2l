@@ -34,6 +34,7 @@ class NotebookExecutor(Executor):
         cache: bool = True,
         output_dir: Optional[Path] = None,
         copy_files: bool = True,
+        register_results: bool = None,
     ):
         """Initialize NotebookExecutor
 
@@ -41,9 +42,21 @@ class NotebookExecutor(Executor):
             cache: Enable caching
             output_dir: Output directory (uses temp if None)
             copy_files: Copy supporting files to output directory
+            register_results: Register results with results service (default: from config)
         """
         super().__init__(cache=cache, output_dir=output_dir)
         self.copy_files = copy_files
+
+        # Check if results registration should be enabled
+        # Use parameter if provided, otherwise check config
+        if register_results is None:
+            config = get_config()
+            # Enable if results service URL is configured or results database exists
+            self.register_results = (
+                hasattr(config, 'results_service_url') and config.results_service_url is not None
+            ) or (Path.home() / ".sim2l" / "results.db").exists()
+        else:
+            self.register_results = register_results
 
     def check_cache(
         self,
@@ -243,6 +256,10 @@ class NotebookExecutor(Executor):
         # Save result to database
         result.save()
 
+        # Register with results service if enabled
+        if self.register_results and result.status == "completed":
+            self._register_result(result, simulation, validated_inputs)
+
         return result
 
     def _extract_outputs(
@@ -323,5 +340,99 @@ class NotebookExecutor(Executor):
 
         return outputs
 
+    def _register_result(
+        self,
+        result: ExecutionResult,
+        simulation: SimulationDefinition,
+        inputs: Dict[str, Any]
+    ):
+        """Register execution result with results service
+
+        Args:
+            result: Execution result to register
+            simulation: Simulation definition
+            inputs: Input parameters
+        """
+        try:
+            import sqlite3
+            import json
+
+            # Get results database path
+            results_db_path = Path.home() / ".sim2l" / "results.db"
+
+            if not results_db_path.exists():
+                logger.debug("Results database not found, skipping registration")
+                return
+
+            # Convert outputs to serializable format (handle Pint quantities and numpy arrays)
+            def to_value(val):
+                """Extract numeric value from Pint quantity, numpy array, or return as-is"""
+                import numpy as np
+
+                # Handle Pint quantities
+                if hasattr(val, 'magnitude'):
+                    val = val.magnitude
+
+                # Handle numpy arrays
+                if isinstance(val, np.ndarray):
+                    return val.tolist()
+
+                # Handle numpy scalars
+                if isinstance(val, (np.integer, np.floating)):
+                    return val.item()
+
+                # Handle regular numbers
+                if isinstance(val, (int, float)):
+                    return float(val)
+
+                # Handle strings and booleans
+                if isinstance(val, (str, bool)):
+                    return val
+
+                # For anything else, try to convert to string
+                return str(val)
+
+            # Serialize outputs
+            outputs_dict = {}
+            if result.outputs:
+                # Use to_dict() to get the raw output data
+                for key, value in result.outputs.to_dict().items():
+                    outputs_dict[key] = to_value(value)
+
+            # Serialize inputs
+            inputs_dict = {}
+            for key, value in inputs.items():
+                inputs_dict[key] = to_value(value)
+
+            # Insert into results database
+            conn = sqlite3.connect(str(results_db_path))
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO execution_results (
+                    execution_id, simulation_name, simulation_version, squid_id,
+                    input_params, output_params, status, duration_seconds,
+                    run_db_path, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                result.squid_id,
+                simulation.name,
+                simulation.version,
+                result.squid_id,
+                json.dumps(inputs_dict),
+                json.dumps(outputs_dict),
+                result.status,
+                result.duration_seconds,
+                ''  # No run database in notebook executor
+            ))
+
+            conn.commit()
+            conn.close()
+
+            logger.debug(f"Registered result {result.squid_id[:40]}... with results service")
+
+        except Exception as e:
+            logger.warning(f"Failed to register result with results service: {e}")
+
     def __repr__(self):
-        return f"NotebookExecutor(cache={self.cache}, copy_files={self.copy_files})"
+        return f"NotebookExecutor(cache={self.cache}, copy_files={self.copy_files}, register_results={self.register_results})"

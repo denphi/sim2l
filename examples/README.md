@@ -4,7 +4,40 @@ This directory contains comprehensive examples demonstrating sim2l's capabilitie
 
 ## Examples Overview
 
-### 1. File Processing Example ⭐ NEW
+### 0. Complete Workflow Example ⭐ RECOMMENDED
+**Full end-to-end demonstration with all services**
+
+- **Files:**
+  - [complete_workflow_example.py](complete_workflow_example.py) - Complete workflow with service management
+  - [quick_start_example.py](quick_start_example.py) - Simplified quick start
+
+- **Features:**
+  - Automatic service lifecycle management (start/stop)
+  - Simulation deployment from notebook
+  - Multiple simulation runs with varying parameters
+  - Automatic caching demonstration
+  - Cache hit/miss tracking
+  - Results database exploration
+  - Parameter statistics analysis
+  - Performance comparison
+
+- **Run:**
+  ```bash
+  # Start services first
+  python3 -m sim2l.services.cache_service &
+  python3 -m sim2l.services.catalog_service &
+  python3 -m sim2l.services.results_service &
+
+  # Run complete workflow
+  python3 examples/complete_workflow_example.py
+
+  # Or just quick start (services must be running)
+  python3 examples/quick_start_example.py
+  ```
+
+---
+
+### 1. File Processing Example
 **Complete workflow for file-based simulations**
 
 - **Files:**
