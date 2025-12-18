@@ -571,8 +571,21 @@ def main():
     parser.add_argument(
         "--db-url", help="PostgreSQL connection string (for postgresql backend)"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable DEBUG logging"
+    )
 
     args = parser.parse_args()
+
+    # Set logging level based on --debug flag
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            force=True
+        )
+        logger.setLevel(logging.DEBUG)
+        logger.debug("DEBUG logging enabled")
 
     global catalog_db
 

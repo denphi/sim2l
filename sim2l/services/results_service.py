@@ -774,14 +774,17 @@ def create_results_service(
             return auth_result
 
         data = request.json
+        logger.debug(f"POST /register_direct - Execution: {data.get('execution_id', 'unknown')}")
 
         # Validate required fields
         required_fields = ['execution_id', 'simulation_name', 'simulation_version',
                           'squid_id', 'input_params', 'output_params', 'status']
         for field in required_fields:
             if field not in data:
+                logger.warning(f"Missing required field: {field}")
                 return jsonify({'error': f'{field} required'}), 400
 
+        logger.debug(f"Registering result - Sim: {data['simulation_name']}, Status: {data['status']}")
         try:
             # Build schema from input/output params
             schema = {
@@ -826,6 +829,7 @@ def create_results_service(
             )
 
             # Register result
+            logger.debug(f"Registering schema for {data['simulation_name']} v{data['simulation_version']}")
             result_id = results_backend.register_result(
                 execution_id=data['execution_id'],
                 simulation_name=data['simulation_name'],
@@ -839,6 +843,7 @@ def create_results_service(
                 metadata=data.get('metadata')
             )
 
+            logger.debug(f"Successfully registered result - ID: {result_id}, Schema ID: {schema_id}")
             return jsonify({
                 'success': True,
                 'result_id': result_id,
@@ -933,13 +938,20 @@ def main():
                         help='Host to bind to')
     parser.add_argument('--no-auth', action='store_true',
                         help='Disable authentication')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable DEBUG logging')
 
     args = parser.parse_args()
 
+    # Set logging level based on --debug flag
+    log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        force=True
     )
+    if args.debug:
+        logger.debug("DEBUG logging enabled")
 
     app = create_results_service(
         backend=args.backend,

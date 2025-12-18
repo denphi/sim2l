@@ -223,21 +223,21 @@ class PostgreSQLWorkflowRunner:
                 'port': 8001,
                 'url': "http://localhost:8001",
                 'backend': 'postgresql',
-                'args': ['--backend', 'postgresql', '--db-url', CACHE_DB_URL, '--no-auth']
+                'args': ['--backend', 'postgresql', '--db-url', CACHE_DB_URL, '--no-auth', '--debug']
             },
             'catalog': {
                 'module': 'sim2l.services.catalog_service',
                 'port': 8002,
                 'url': "http://localhost:8002",
                 'backend': 'sqlite',  # Catalog doesn't have PostgreSQL backend yet
-                'args': []  # Uses default SQLite backend
+                'args': ['--debug']  # Uses default SQLite backend with debug logging
             },
             'results': {
                 'module': 'sim2l.services.results_service',
                 'port': 8003,
                 'url': "http://localhost:8003",
                 'backend': 'postgresql',
-                'args': ['--backend', 'postgresql', '--db-url', RESULTS_DB_URL, '--no-auth']
+                'args': ['--backend', 'postgresql', '--db-url', RESULTS_DB_URL, '--no-auth', '--debug']
             },
         }
 
@@ -399,10 +399,12 @@ class PostgreSQLWorkflowRunner:
         # Load simulation
         sim = sim2l.load_simulation("thermal_analysis")
 
-        # Configure sim2l to use cache service
+        # Configure sim2l to use services
         sim2l.configure(
             cache_service_url="http://localhost:8001",
-            catalog_service_url="http://localhost:8002"
+            catalog_service_url="http://localhost:8002",
+            results_service_url="http://localhost:8003",
+            debug_mode=True  # Enable DEBUG logging
         )
 
         # Create executor with results registration enabled
@@ -456,7 +458,7 @@ class PostgreSQLWorkflowRunner:
                 },
                 'execution_time': exec_time,
                 'cached': cached,
-                'squid_id': result.squid_id if hasattr(result, 'squid_id') else ''
+                'squid_id': result.squid_id if (hasattr(result, 'squid_id') and result.squid_id) else 'N/A'
             }
 
             results.append(result_info)

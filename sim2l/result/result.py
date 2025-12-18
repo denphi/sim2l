@@ -217,6 +217,18 @@ class ExecutionResult:
             # Parse timestamp
             executed_at = datetime.fromisoformat(row['executed_at'])
 
+            # Load output schema from simulation
+            output_schema = None
+            try:
+                from ..repository import SimulationRepository
+                repo = SimulationRepository()
+                sim = repo.load(row['simulation_name'], row['simulation_version'])
+                if sim:
+                    output_schema = sim.outputs
+            except Exception as e:
+                logger.debug(f"Could not load output schema for {row['simulation_name']}/{row['simulation_version']}: {e}")
+                pass  # Schema not available, outputs will be None
+
             # Create result
             result = cls(
                 execution_id=row['id'],
@@ -225,6 +237,7 @@ class ExecutionResult:
                 simulation_version=row['simulation_version'],
                 inputs=json.loads(row['inputs']),
                 output_data=output_data,
+                output_schema=output_schema,
                 status=row['status'],
                 executed_at=executed_at,
                 duration_seconds=row['duration_seconds'],

@@ -447,7 +447,7 @@ class HTMLReportGenerator:
                 <td>{outputs_html}</td>
                 <td>{result['execution_time']:.3f}s</td>
                 <td>{cache_badge}</td>
-                <td><code>{result.get('squid_id', 'N/A')[:16]}...</code></td>
+                <td><code>{(result.get('squid_id') or 'N/A')[:16]}...</code></td>
             </tr>
 """
 

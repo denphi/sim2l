@@ -16,7 +16,7 @@ import papermill as pm
 from .base import Executor
 from ..definition import SimulationDefinition
 from ..result import ExecutionResult
-from ..utils import compute_squid_id, compute_cache_key
+from ..utils import compute_squid_id
 from ..config import get_config, get_logger
 
 logger = get_logger()
@@ -73,20 +73,65 @@ class NotebookExecutor(Executor):
             Cached ExecutionResult or None
         """
         if not self.cache:
+            logger.debug("Cache is disabled, skipping cache check")
             return None
 
-        # Get simulation DB ID
-        from ..repository import SimulationRepository
-        repo = SimulationRepository()
-        sim_id = repo.get_simulation_id(simulation.name, simulation.version)
+        # Prepare/validate inputs to match what will be used in execution
+        validated_inputs = self.prepare_inputs(simulation, inputs)
 
-        if sim_id is None:
+        # Compute SQUID ID (deterministic cache key)
+        squid_id = compute_squid_id(
+            simtool_name=simulation.name,
+            simtool_revision=simulation.version,
+            inputs=validated_inputs
+        )
+        logger.debug(f"Computed SQUID ID for cache lookup: {squid_id}")
+
+        # Check if cache service is configured
+        config = get_config()
+        logger.debug(f"Cache service URL: {getattr(config, 'cache_service_url', 'NOT SET')}")
+        if hasattr(config, 'cache_service_url') and config.cache_service_url:
+            # Use cache service with SQUID ID as cache key
+            logger.debug(f"Using cache service at {config.cache_service_url}")
+            return self._check_cache_service(squid_id)
+        else:
+            # Use local SQLite cache with SQUID ID as cache key
+            logger.debug("Using local SQLite cache")
+            return self._check_cache_local(squid_id)
+
+    def _check_cache_service(self, cache_key: str) -> Optional[ExecutionResult]:
+        """Check cache service for cached result"""
+        try:
+            from ..database import CacheClient
+            config = get_config()
+
+            logger.debug(f"Checking cache service for key: {cache_key}")
+            cache_client = CacheClient(service_url=config.cache_service_url)
+            cached_data = cache_client.get(cache_key)
+
+            if cached_data is None:
+                logger.debug(f"Cache miss for key: {cache_key}")
+                return None
+
+            logger.debug(f"Cache hit for key: {cache_key}, data: {cached_data}")
+            # Load execution result from cached data
+            execution_id = cached_data.get('execution_id')
+            if execution_id:
+                from ..result import load_result
+                logger.debug(f"Loading cached result from execution: {execution_id}")
+                result = load_result(execution_id)
+                logger.info(f"CACHED. Fetching results from execution {execution_id[:8]}...")
+                return result
+
+            logger.warning(f"Cache data missing execution_id: {cached_data}")
             return None
 
-        # Compute cache key
-        cache_key = compute_cache_key(sim_id, inputs)
+        except Exception as e:
+            logger.warning(f"Failed to check cache service: {e}", exc_info=True)
+            return None
 
-        # Check cache table
+    def _check_cache_local(self, cache_key: str) -> Optional[ExecutionResult]:
+        """Check local SQLite cache for cached result"""
         db_path = get_config().db_path
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -177,15 +222,15 @@ class NotebookExecutor(Executor):
         repo = SimulationRepository()
         sim_id = repo.get_simulation_id(simulation.name, simulation.version)
 
-        # Compute SQUID ID
+        # Compute SQUID ID (also used as cache key for deterministic caching)
         squid_id = compute_squid_id(
             simtool_name=simulation.name,
             simtool_revision=simulation.version,
             inputs=validated_inputs
         )
 
-        # Compute cache key
-        cache_key = compute_cache_key(sim_id, validated_inputs) if sim_id else None
+        # Use SQUID ID as cache key (deterministic based on simulation + inputs)
+        cache_key = squid_id
 
         # Create execution result
         result = ExecutionResult.create(
@@ -255,6 +300,12 @@ class NotebookExecutor(Executor):
 
         # Save result to database
         result.save()
+
+        # Store in cache service if configured and execution successful
+        if self.cache and result.status == "completed" and result.cache_key:
+            config = get_config()
+            if hasattr(config, 'cache_service_url') and config.cache_service_url:
+                self._store_cache_service(result)
 
         # Register with results service if enabled
         if self.register_results and result.status == "completed":
@@ -339,6 +390,66 @@ class NotebookExecutor(Executor):
             logger.error(f"Failed to extract outputs from scrapbook: {e}")
 
         return outputs
+
+    def _store_cache_service(self, result: ExecutionResult):
+        """Store result in cache service
+
+        Args:
+            result: Execution result to cache
+        """
+        try:
+            from ..database import CacheClient
+            import hashlib
+            import json
+            import numpy as np
+            config = get_config()
+
+            cache_client = CacheClient(service_url=config.cache_service_url)
+
+            # Convert inputs to JSON-serializable format (extract magnitudes from Pint Quantities)
+            serializable_inputs = {}
+            for key, value in result.inputs.items():
+                if hasattr(value, 'magnitude'):
+                    # Extract magnitude from Pint Quantity
+                    serializable_inputs[key] = value.magnitude
+                elif isinstance(value, np.ndarray):
+                    # Convert numpy arrays to lists
+                    serializable_inputs[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    # Convert numpy scalars to Python types
+                    serializable_inputs[key] = value.item()
+                else:
+                    serializable_inputs[key] = value
+
+            # Compute input hash for cache entry
+            input_hash = hashlib.sha256(
+                json.dumps(serializable_inputs, sort_keys=True).encode()
+            ).hexdigest()
+
+            # Store cache entry with all required parameters
+            success = cache_client.set(
+                cache_key=result.cache_key,
+                simulation_id=result.simulation_id,
+                simulation_name=result.simulation_name,
+                simulation_version=result.simulation_version,
+                execution_id=result.execution_id,
+                squid_id=result.squid_id,
+                input_hash=input_hash,
+                run_db_path='',  # NotebookExecutor doesn't use per-run databases
+                ttl_seconds=None,  # No expiration
+                metadata={
+                    'executed_at': result.executed_at.isoformat(),
+                    'duration_seconds': result.duration_seconds
+                }
+            )
+
+            if success:
+                logger.debug(f"Stored result in cache service: {result.cache_key[:40]}...")
+            else:
+                logger.warning(f"Failed to store result in cache service")
+
+        except Exception as e:
+            logger.warning(f"Failed to store result in cache service: {e}")
 
     def _register_result(
         self,

@@ -311,13 +311,18 @@ class SQLiteCacheBackend(CacheServiceBackend):
 class PostgreSQLCacheBackend(CacheServiceBackend):
     """PostgreSQL backend for cache service."""
 
-    def __init__(self, connection_string: str):
+    def __init__(self, connection_string: str, no_auth: bool = False):
         import psycopg2
         import psycopg2.extras
 
         self.conn = psycopg2.connect(connection_string)
         psycopg2.extras.register_uuid()
+        self.no_auth = no_auth
         self._create_schema()
+
+        # Create demo session if running in no-auth mode
+        if self.no_auth:
+            self._create_demo_session()
 
     def _create_schema(self):
         """Create cache database schema."""
@@ -333,9 +338,33 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         self.conn.commit()
         logger.info("PostgreSQL cache schema created")
 
+    def _create_demo_session(self):
+        """Create demo session for no-auth mode."""
+        cursor = self.conn.cursor()
+
+        # Check if demo-session already exists
+        cursor.execute(
+            "SELECT session_id FROM cache_sessions WHERE session_id = 'demo-session'"
+        )
+        if cursor.fetchone():
+            logger.debug("Demo session already exists")
+            return
+
+        # Create demo session with write privileges
+        cursor.execute(
+            """
+            INSERT INTO cache_sessions (session_id, user_id, expires_at, access_level, is_valid)
+            VALUES ('demo-session', 0, '2099-12-31 23:59:59', 'write', true)
+            ON CONFLICT (session_id) DO NOTHING
+            """
+        )
+        self.conn.commit()
+        logger.info("Created demo session for no-auth mode")
+
     def get(self, cache_key: str, session_id: str):
         cursor = self.conn.cursor()
 
+        logger.debug(f"PostgreSQL: Getting cache entry - Key: {cache_key}, Session: {session_id}")
         # Use the stored function for cache get
         cursor.execute(
             "SELECT * FROM get_cache_entry(%s, %s)", (cache_key, session_id)
@@ -345,6 +374,7 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         self.conn.commit()
 
         if row:
+            logger.debug(f"PostgreSQL: Cache entry found - Execution ID: {row[0]}")
             return {
                 "execution_id": row[0],
                 "squid_id": row[1],
@@ -352,33 +382,49 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
                 "metadata": row[3],
             }, 200
         else:
+            logger.debug(f"PostgreSQL: Cache entry not found - Key: {cache_key}")
             return None, 404
 
     def set(self, data: dict, session_id: str):
+        import json
         cursor = self.conn.cursor()
 
-        # Use the stored function for cache set
-        cursor.execute(
-            """
-            SELECT set_cache_entry(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                data["cache_key"],
-                data["simulation_id"],
-                data["simulation_name"],
-                data["simulation_version"],
-                data["execution_id"],
-                data["squid_id"],
-                data["input_hash"],
-                data["run_db_path"],
-                session_id,
-                data.get("ttl_seconds"),
-                data.get("metadata"),
-            ),
-        )
+        logger.debug(f"PostgreSQL: Setting cache entry - Key: {data.get('cache_key')}, Session: {session_id}")
+        logger.debug(f"PostgreSQL: Cache data - Sim: {data.get('simulation_name')}, Exec: {data.get('execution_id')}")
 
-        self.conn.commit()
-        return {"success": True}, 200
+        # Convert metadata dict to JSON string for PostgreSQL JSONB
+        metadata = data.get("metadata")
+        if metadata is not None and isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
+
+        # Use the stored function for cache set
+        try:
+            cursor.execute(
+                """
+                SELECT set_cache_entry(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    data["cache_key"],
+                    data["simulation_id"],
+                    data["simulation_name"],
+                    data["simulation_version"],
+                    data["execution_id"],
+                    data["squid_id"],
+                    data["input_hash"],
+                    data["run_db_path"],
+                    session_id,
+                    data.get("ttl_seconds"),
+                    metadata,
+                ),
+            )
+
+            self.conn.commit()
+            logger.debug(f"PostgreSQL: Successfully stored cache entry - Key: {data.get('cache_key')}")
+            return {"success": True}, 200
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"PostgreSQL: Error setting cache entry: {e}", exc_info=True)
+            raise
 
     def invalidate(self, filters: dict, session_id: str):
         cursor = self.conn.cursor()
@@ -449,25 +495,40 @@ def health():
 @app.route("/cache/<path:cache_key>", methods=["GET"])
 def get_cache(cache_key):
     session_id = request.headers.get("X-Session-ID", "demo-session")
+    logger.debug(f"GET /cache/{cache_key} - Session: {session_id}")
     if require_auth and not session_id:
+        logger.warning(f"Missing session ID for cache key: {cache_key}")
         return jsonify({"error": "Missing session ID"}), 401
 
     data, status = cache_db.get(cache_key, session_id)
     if data:
+        logger.debug(f"Cache hit for key: {cache_key}")
         return jsonify(data), status
     else:
+        logger.debug(f"Cache miss for key: {cache_key}")
         return jsonify({"error": "Not found"}), status
 
 
 @app.route("/cache", methods=["POST"])
 def set_cache():
     session_id = request.headers.get("X-Session-ID", "demo-session")
+    logger.debug(f"POST /cache - Session: {session_id}")
     if require_auth and not session_id:
+        logger.warning("Missing session ID for cache set")
         return jsonify({"error": "Missing session ID"}), 401
 
     data = request.json
-    result, status = cache_db.set(data, session_id)
-    return jsonify(result), status
+    logger.debug(f"Setting cache entry: {data.get('cache_key', 'unknown')}")
+    try:
+        result, status = cache_db.set(data, session_id)
+        if status == 200:
+            logger.debug(f"Successfully stored cache entry: {data.get('cache_key', 'unknown')}")
+        else:
+            logger.warning(f"Failed to store cache entry: {data.get('cache_key', 'unknown')} - Status: {status}")
+        return jsonify(result), status
+    except Exception as e:
+        logger.error(f"Error storing cache entry: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/cache/invalidate", methods=["POST"])
@@ -509,8 +570,21 @@ def main():
     parser.add_argument(
         "--no-auth", action="store_true", help="Disable authentication (demo mode)"
     )
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable DEBUG logging"
+    )
 
     args = parser.parse_args()
+
+    # Set logging level based on --debug flag
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            force=True
+        )
+        logger.setLevel(logging.DEBUG)
+        logger.debug("DEBUG logging enabled")
 
     global cache_db
     global require_auth
@@ -541,7 +615,7 @@ def main():
         if not args.db_url:
             logger.error("PostgreSQL backend requires --db-url")
             sys.exit(1)
-        cache_db = PostgreSQLCacheBackend(args.db_url)
+        cache_db = PostgreSQLCacheBackend(args.db_url, no_auth=not require_auth)
         logger.info("Using PostgreSQL backend")
 
     # Start server

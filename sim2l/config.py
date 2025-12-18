@@ -16,6 +16,7 @@ class Config:
         self.artifact_storage = "database"  # or "filesystem"
         self.artifact_base_path = None
         self.log_level = "INFO"
+        self.debug_mode = False  # Enable DEBUG logging across all services
         self._logger = None
 
         # Database service configuration
@@ -30,6 +31,10 @@ class Config:
         self.catalog_service_url = None  # Master catalog URL (None = local catalog)
         self.catalog_session_id = None  # Session ID for catalog service
         self.catalog_auto_sync = True  # Auto-sync new simulations to catalog
+
+        # Results service configuration
+        self.results_service_url = None  # Results service URL (None = local results DB)
+        self.results_session_id = None  # Session ID for results service
 
     def _default_db_path(self) -> Path:
         """Default database location"""
@@ -64,11 +69,13 @@ class Config:
             "artifact_storage": self.artifact_storage,
             "artifact_base_path": str(self.artifact_base_path) if self.artifact_base_path else None,
             "log_level": self.log_level,
+            "debug_mode": self.debug_mode,
             "use_run_database": self.use_run_database,
             "run_db_base_path": str(self.run_db_base_path) if self.run_db_base_path else None,
             "cache_service_url": self.cache_service_url,
             "catalog_service_url": self.catalog_service_url,
             "catalog_auto_sync": self.catalog_auto_sync,
+            "results_service_url": self.results_service_url,
         }
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_path, 'w') as f:
@@ -78,7 +85,9 @@ class Config:
         """Get configured logger"""
         if self._logger is None:
             self._logger = logging.getLogger("sim2l")
-            self._logger.setLevel(getattr(logging, self.log_level))
+            # Use DEBUG if debug_mode is enabled, otherwise use configured log_level
+            level = logging.DEBUG if self.debug_mode else getattr(logging, self.log_level)
+            self._logger.setLevel(level)
 
             # Add console handler if not already added
             if not self._logger.handlers:
@@ -102,6 +111,8 @@ if os.environ.get("SIM2L_DEFAULT_EXECUTOR"):
     _config.default_executor = os.environ["SIM2L_DEFAULT_EXECUTOR"]
 if os.environ.get("SIM2L_LOG_LEVEL"):
     _config.log_level = os.environ["SIM2L_LOG_LEVEL"]
+if os.environ.get("SIM2L_DEBUG_MODE"):
+    _config.debug_mode = os.environ["SIM2L_DEBUG_MODE"].lower() in ("true", "1", "yes")
 if os.environ.get("SIM2L_USE_RUN_DATABASE"):
     _config.use_run_database = os.environ["SIM2L_USE_RUN_DATABASE"].lower() in ("true", "1", "yes")
 if os.environ.get("SIM2L_RUN_DB_BASE_PATH"):
@@ -116,6 +127,10 @@ if os.environ.get("SIM2L_CATALOG_SESSION_ID"):
     _config.catalog_session_id = os.environ["SIM2L_CATALOG_SESSION_ID"]
 if os.environ.get("SIM2L_CATALOG_AUTO_SYNC"):
     _config.catalog_auto_sync = os.environ["SIM2L_CATALOG_AUTO_SYNC"].lower() in ("true", "1", "yes")
+if os.environ.get("SIM2L_RESULTS_SERVICE_URL"):
+    _config.results_service_url = os.environ["SIM2L_RESULTS_SERVICE_URL"]
+if os.environ.get("SIM2L_RESULTS_SESSION_ID"):
+    _config.results_session_id = os.environ["SIM2L_RESULTS_SESSION_ID"]
 
 # Try to load from user config file
 _user_config = Path.home() / ".sim2l" / "config.json"
