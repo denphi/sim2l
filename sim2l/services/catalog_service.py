@@ -52,6 +52,9 @@ class CatalogServiceBackend:
     def approve_sync(self, request_id, session_id):
         raise NotImplementedError
 
+    def get_overview_stats(self):
+        raise NotImplementedError
+
     def health_check(self):
         raise NotImplementedError
 
@@ -459,6 +462,48 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             self.conn.commit()
             return result, status
 
+    def get_overview_stats(self):
+        """Get overview statistics for dashboard"""
+        try:
+            cursor = self.conn.cursor()
+
+            # Total simulations
+            cursor.execute("SELECT COUNT(*) FROM simulations")
+            total_simulations = cursor.fetchone()[0]
+
+            # Active simulations (status = 'active')
+            cursor.execute("SELECT COUNT(*) FROM simulations WHERE status = 'active'")
+            active_simulations = cursor.fetchone()[0]
+
+            # Total executions
+            cursor.execute("SELECT COUNT(*) FROM executions")
+            total_executions = cursor.fetchone()[0]
+
+            # Successful executions
+            cursor.execute("SELECT COUNT(*) FROM executions WHERE status = 'success'")
+            successful_executions = cursor.fetchone()[0]
+
+            # Cached executions
+            cursor.execute("SELECT COUNT(*) FROM executions WHERE cache_hit = 1")
+            cached_executions = cursor.fetchone()[0]
+
+            return {
+                "total_simulations": total_simulations,
+                "active_simulations": active_simulations,
+                "total_executions": total_executions,
+                "successful_executions": successful_executions,
+                "cached_executions": cached_executions,
+            }, 200
+        except Exception as e:
+            logger.error(f"Error getting overview stats: {e}")
+            return {
+                "total_simulations": 0,
+                "active_simulations": 0,
+                "total_executions": 0,
+                "successful_executions": 0,
+                "cached_executions": 0,
+            }, 200
+
     def health_check(self):
         try:
             cursor = self.conn.cursor()
@@ -550,6 +595,13 @@ def approve_sync(request_id):
         return jsonify({"error": "Missing session ID"}), 401
 
     result, status = catalog_db.approve_sync(request_id, session_id)
+    return jsonify(result), status
+
+
+@app.route("/statistics/overview", methods=["GET"])
+def get_overview_stats():
+    """Get overview statistics for the dashboard"""
+    result, status = catalog_db.get_overview_stats()
     return jsonify(result), status
 
 

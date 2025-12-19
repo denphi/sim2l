@@ -399,13 +399,7 @@ class PostgreSQLWorkflowRunner:
         # Load simulation
         sim = sim2l.load_simulation("thermal_analysis")
 
-        # Configure sim2l to use services
-        sim2l.configure(
-            cache_service_url="http://localhost:8001",
-            catalog_service_url="http://localhost:8002",
-            results_service_url="http://localhost:8003",
-            debug_mode=True  # Enable DEBUG logging
-        )
+        # Configuration is already done in run() method
 
         # Create executor with results registration enabled
         from sim2l.executor import NotebookExecutor
@@ -690,10 +684,12 @@ class PostgreSQLWorkflowRunner:
             # Start services
             service_status = self.start_services()
 
-            # Configure sim2l
+            # Configure sim2l with all service URLs
             sim2l.configure(
                 cache_service_url="http://localhost:8001",
-                catalog_service_url="http://localhost:8002"
+                catalog_service_url="http://localhost:8002",
+                results_service_url="http://localhost:8003",
+                debug_mode=True
             )
 
             # Deploy simulation

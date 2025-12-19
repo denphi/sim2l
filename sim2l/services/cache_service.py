@@ -307,6 +307,72 @@ class SQLiteCacheBackend(CacheServiceBackend):
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 500
 
+    def list_entries(self, limit=25, offset=0, simulation_id=None, simulation_name=None, status=None, session_id=None):
+        """List cache entries with pagination and filters"""
+        if not self._check_session(session_id):
+            return {"error": "Unauthorized"}, 401
+
+        cursor = self.conn.cursor()
+
+        conditions = []
+        params = []
+
+        if simulation_id:
+            conditions.append("simulation_id = ?")
+            params.append(simulation_id)
+
+        if simulation_name:
+            conditions.append("simulation_name = ?")
+            params.append(simulation_name)
+
+        if status == 'valid':
+            conditions.append("status = 'valid'")
+        elif status == 'invalidated':
+            conditions.append("status = 'invalidated'")
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # Get total count
+        cursor.execute(f"SELECT COUNT(*) FROM cache_entries WHERE {where_clause}", params)
+        total = cursor.fetchone()[0]
+
+        # Get entries
+        params.extend([limit, offset])
+        cursor.execute(f"""
+            SELECT
+                cache_key, simulation_id, simulation_name, simulation_version,
+                execution_id, squid_id, input_hash, created_at, last_accessed,
+                access_count, hit_count, status
+            FROM cache_entries
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """, params)
+
+        entries = []
+        for row in cursor.fetchall():
+            entries.append({
+                "cache_key": row["cache_key"],
+                "simulation_id": row["simulation_id"],
+                "simulation_name": row["simulation_name"],
+                "simulation_version": row["simulation_version"],
+                "execution_id": row["execution_id"],
+                "squid_id": row["squid_id"],
+                "input_hash": row["input_hash"],
+                "created_at": row["created_at"],
+                "last_accessed_at": row["last_accessed"],
+                "access_count": row["access_count"],
+                "hit_count": row["hit_count"],
+                "status": row["status"]
+            })
+
+        return {
+            "entries": entries,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }, 200
+
 
 class PostgreSQLCacheBackend(CacheServiceBackend):
     """PostgreSQL backend for cache service."""
@@ -452,6 +518,7 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
     def get_stats(self, simulation_id: Optional[int]):
         cursor = self.conn.cursor()
 
+        # First try the cache_stats_summary view
         cursor.execute(
             """
             SELECT
@@ -465,7 +532,7 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
 
         row = cursor.fetchone()
 
-        if row:
+        if row and row[0] is not None:
             return {
                 "total_requests": row[0],
                 "total_hits": row[1],
@@ -473,8 +540,60 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
                 "hit_rate_percent": row[3],
                 "total_size_mb": row[4],
             }, 200
+
+        # Fallback: calculate stats directly from cache_entries table
+        if simulation_id:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) as total_entries,
+                    SUM(access_count) as total_accesses,
+                    SUM(hit_count) as total_hits,
+                    SUM(size_bytes) as total_size_bytes
+                FROM cache_entries
+                WHERE simulation_id = %s
+                AND status = 'valid'
+                """,
+                (simulation_id,),
+            )
         else:
-            return {}, 200
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) as total_entries,
+                    SUM(access_count) as total_accesses,
+                    SUM(hit_count) as total_hits,
+                    SUM(size_bytes) as total_size_bytes
+                FROM cache_entries
+                WHERE status = 'valid'
+                """
+            )
+
+        row = cursor.fetchone()
+
+        if row:
+            total_entries = row[0] or 0
+            total_accesses = row[1] or 0
+            total_hits = row[2] or 0
+            total_size_bytes = row[3] or 0
+
+            hit_rate = (total_hits / total_accesses * 100) if total_accesses > 0 else 0
+
+            return {
+                "total_entries": total_entries,
+                "total_accesses": total_accesses,
+                "total_hits": total_hits,
+                "hit_rate_percent": round(hit_rate, 2),
+                "total_size_mb": round(total_size_bytes / (1024 * 1024), 2) if total_size_bytes else 0,
+            }, 200
+        else:
+            return {
+                "total_entries": 0,
+                "total_accesses": 0,
+                "total_hits": 0,
+                "hit_rate_percent": 0,
+                "total_size_mb": 0,
+            }, 200
 
     def health_check(self):
         try:
@@ -483,6 +602,72 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             return {"status": "healthy", "backend": "postgresql"}, 200
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}, 500
+
+    def list_entries(self, limit=25, offset=0, simulation_id=None, simulation_name=None, status=None, session_id=None):
+        """List cache entries with pagination and filters"""
+        cursor = self.conn.cursor()
+
+        conditions = []
+        params = []
+
+        if simulation_id:
+            conditions.append("simulation_id = %s")
+            params.append(simulation_id)
+
+        if simulation_name:
+            conditions.append("simulation_name = %s")
+            params.append(simulation_name)
+
+        if status == 'valid':
+            conditions.append("status = %s")
+            params.append('valid')
+        elif status == 'invalidated':
+            conditions.append("status = %s")
+            params.append('invalidated')
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        # Get total count
+        cursor.execute(f"SELECT COUNT(*) FROM cache_entries WHERE {where_clause}", params)
+        total = cursor.fetchone()[0]
+
+        # Get entries
+        params.extend([limit, offset])
+        cursor.execute(f"""
+            SELECT
+                cache_key, simulation_id, simulation_name, simulation_version,
+                execution_id, squid_id, input_hash, created_at, last_accessed,
+                access_count, hit_count, size_bytes, status
+            FROM cache_entries
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, params)
+
+        entries = []
+        for row in cursor.fetchall():
+            entries.append({
+                "cache_key": row[0],
+                "simulation_id": row[1],
+                "simulation_name": row[2],
+                "simulation_version": row[3],
+                "execution_id": row[4],
+                "squid_id": row[5],
+                "input_hash": row[6],
+                "created_at": str(row[7]),
+                "last_accessed_at": str(row[8]) if row[8] else None,
+                "access_count": row[9],
+                "hit_count": row[10],
+                "size_bytes": row[11],
+                "status": row[12]
+            })
+
+        return {
+            "entries": entries,
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }, 200
 
 
 # REST API Endpoints
@@ -547,6 +732,34 @@ def get_stats():
     simulation_id = request.args.get("simulation_id", type=int)
     result, status = cache_db.get_stats(simulation_id)
     return jsonify(result), status
+
+
+@app.route("/cache/entries", methods=["GET"])
+def list_cache_entries():
+    """List all cache entries with pagination and filters"""
+    session_id = request.headers.get("X-Session-ID", "demo-session")
+    if require_auth and not session_id:
+        return jsonify({"error": "Missing session ID"}), 401
+
+    limit = request.args.get("limit", 25, type=int)
+    offset = request.args.get("offset", 0, type=int)
+    simulation_id = request.args.get("simulation_id", type=int)
+    simulation_name = request.args.get("simulation_name")
+    status = request.args.get("status")  # 'valid' or 'invalidated'
+
+    try:
+        result, http_status = cache_db.list_entries(
+            limit=limit,
+            offset=offset,
+            simulation_id=simulation_id,
+            simulation_name=simulation_name,
+            status=status,
+            session_id=session_id
+        )
+        return jsonify(result), http_status
+    except Exception as e:
+        logger.error(f"Error listing cache entries: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 
 def main():
