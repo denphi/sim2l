@@ -318,7 +318,7 @@ class LocalCacheClient:
         self._stats["sets"] += 1
 
         expires_at = None
-        if ttl_seconds:
+        if ttl_seconds is not None:
             expires_at = (
                 datetime.utcnow() + timedelta(seconds=ttl_seconds)
             ).isoformat()

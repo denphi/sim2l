@@ -3,36 +3,8 @@
 import hashlib
 import json
 from typing import Any, Dict
-import numpy as np
 
-
-def _serialize_value(value):
-    """Convert value to JSON-serializable format
-
-    Handles:
-    - Pint Quantity objects -> magnitude
-    - NumPy types -> Python types
-    - Lists/arrays -> lists
-    """
-    # Handle Pint Quantity
-    if hasattr(value, 'magnitude'):
-        return _serialize_value(value.magnitude)
-
-    # Handle NumPy types
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (np.integer, np.floating)):
-        return value.item()
-
-    # Handle lists/tuples
-    if isinstance(value, (list, tuple)):
-        return [_serialize_value(v) for v in value]
-
-    # Handle dicts
-    if isinstance(value, dict):
-        return {k: _serialize_value(v) for k, v in value.items()}
-
-    return value
+from .serialization import serialize_for_hashing as _serialize_value
 
 
 def compute_hash(data: Any) -> str:

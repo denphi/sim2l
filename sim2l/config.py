@@ -104,7 +104,12 @@ class Config:
 # Global config instance
 _config = Config()
 
-# Load environment variables
+# Load from user config file first so that env vars can override it below
+_user_config = Path.home() / ".sim2l" / "config.json"
+if _user_config.exists():
+    _config.load_from_file(_user_config)
+
+# Apply environment variables — these take highest precedence over the config file
 if os.environ.get("SIM2L_CACHE_ENABLED"):
     _config.cache_enabled = os.environ["SIM2L_CACHE_ENABLED"].lower() in ("true", "1", "yes")
 if os.environ.get("SIM2L_DEFAULT_EXECUTOR"):
@@ -131,11 +136,6 @@ if os.environ.get("SIM2L_RESULTS_SERVICE_URL"):
     _config.results_service_url = os.environ["SIM2L_RESULTS_SERVICE_URL"]
 if os.environ.get("SIM2L_RESULTS_SESSION_ID"):
     _config.results_session_id = os.environ["SIM2L_RESULTS_SESSION_ID"]
-
-# Try to load from user config file
-_user_config = Path.home() / ".sim2l" / "config.json"
-if _user_config.exists():
-    _config.load_from_file(_user_config)
 
 
 def get_config() -> Config:

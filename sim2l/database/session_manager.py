@@ -3,12 +3,17 @@ Session management for authentication and privilege checking.
 """
 
 import uuid
-import hashlib
-from datetime import datetime, timedelta
+import bcrypt
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (DB-compatible)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Session:
@@ -29,12 +34,12 @@ class Session:
         self.privileges = set(privileges)
         self.expires_at = expires_at
         self.metadata = metadata or {}
-        self.created_at = datetime.utcnow()
-        self.last_activity = datetime.utcnow()
+        self.created_at = _utcnow()
+        self.last_activity = _utcnow()
 
     def is_valid(self) -> bool:
         """Check if session is still valid."""
-        return datetime.utcnow() < self.expires_at
+        return _utcnow() < self.expires_at
 
     def has_privilege(self, privilege: str) -> bool:
         """Check if session has a specific privilege."""
@@ -42,7 +47,7 @@ class Session:
 
     def update_activity(self):
         """Update last activity timestamp."""
-        self.last_activity = datetime.utcnow()
+        self.last_activity = _utcnow()
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert session to dictionary."""
@@ -79,6 +84,10 @@ class SessionManager:
 
     def _create_default_admin(self):
         """Create default admin user for local development."""
+        logger.warning(
+            "Default admin user created with password 'admin'. "
+            "Change this immediately in any non-development environment via create_user()."
+        )
         admin_user = {
             "id": 1,
             "username": "admin",
@@ -90,9 +99,18 @@ class SessionManager:
         self._username_to_id["admin"] = 1
         self._next_user_id = 2
 
-    def _hash_password(self, password: str) -> str:
-        """Hash a password using SHA256."""
-        return hashlib.sha256(password.encode()).hexdigest()
+    def _hash_password(self, password: str) -> bytes:
+        """Hash a password using bcrypt with a random salt."""
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+
+    def _verify_password(self, password: str, hashed) -> bool:
+        """Verify a password against a bcrypt hash."""
+        if isinstance(hashed, str):
+            hashed = hashed.encode("utf-8")
+        if isinstance(password, bytes):
+            # Reject non-string passwords to avoid bcrypt misuse
+            return False
+        return bcrypt.checkpw(password.encode("utf-8"), hashed)
 
     def create_user(
         self,
@@ -114,7 +132,7 @@ class SessionManager:
             "password_hash": self._hash_password(password),
             "role": role,
             "email": email,
-            "created_at": datetime.utcnow(),
+            "created_at": _utcnow(),
         }
 
         self._users[user_id] = user
@@ -145,9 +163,8 @@ class SessionManager:
             raise ValueError("Invalid username or password")
 
         user = self._users[user_id]
-        password_hash = self._hash_password(password)
 
-        if user["password_hash"] != password_hash:
+        if not self._verify_password(password, user["password_hash"]):
             raise ValueError("Invalid username or password")
 
         # Determine privileges based on role
@@ -161,8 +178,8 @@ class SessionManager:
 
         # Create session
         session_id = str(uuid.uuid4())
-        ttl = ttl_hours or self.default_ttl_hours
-        expires_at = datetime.utcnow() + timedelta(hours=ttl)
+        ttl = ttl_hours if ttl_hours is not None else self.default_ttl_hours
+        expires_at = _utcnow() + timedelta(hours=ttl)
 
         session = Session(
             session_id=session_id,
@@ -260,8 +277,8 @@ class SessionManager:
             Session object
         """
         session_id = str(uuid.uuid4())
-        ttl = ttl_hours or self.default_ttl_hours
-        expires_at = datetime.utcnow() + timedelta(hours=ttl)
+        ttl = ttl_hours if ttl_hours is not None else self.default_ttl_hours
+        expires_at = _utcnow() + timedelta(hours=ttl)
         privileges = privileges or ["read", "write"]
 
         session = Session(

@@ -9,10 +9,11 @@ import os
 import sys
 import argparse
 import logging
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
-from datetime import datetime
 
 # Setup logging
 logging.basicConfig(
@@ -26,6 +27,54 @@ app = Flask(__name__)
 # Database backend (will be initialized in main)
 cache_db = None
 require_auth = True  # Set to False with --no-auth flag
+
+
+def adapt_postgres_schema_for_sqlite(schema_sql: str) -> str:
+    """Convert a PostgreSQL schema SQL to SQLite-compatible SQL.
+
+    Handles type substitutions and strips PostgreSQL-specific constructs
+    (functions, views, custom operators) that SQLite doesn't support.
+    """
+    # Type substitutions (order matters: BIGSERIAL before BIGINT)
+    schema_sql = schema_sql.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    schema_sql = schema_sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    schema_sql = schema_sql.replace("BIGINT", "INTEGER")
+    schema_sql = schema_sql.replace("JSONB", "TEXT")
+    schema_sql = schema_sql.replace("BOOLEAN", "INTEGER")
+    schema_sql = schema_sql.replace("DEFAULT true", "DEFAULT 1")
+    schema_sql = schema_sql.replace("DEFAULT false", "DEFAULT 0")
+    schema_sql = schema_sql.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+
+    # Remove PostgreSQL-specific blocks (functions, views)
+    lines = schema_sql.split("\n")
+    filtered_lines = []
+    skip_until_end = False
+    paren_depth = 0
+
+    for line in lines:
+        if "CREATE OR REPLACE FUNCTION" in line or "CREATE OR REPLACE VIEW" in line:
+            skip_until_end = True
+            paren_depth = 0
+
+        if skip_until_end:
+            if "$$" in line:
+                if paren_depth == 0:
+                    paren_depth = 1
+                else:
+                    paren_depth = 0
+                    skip_until_end = False
+            elif line.endswith(";") and paren_depth == 0:
+                skip_until_end = False
+            continue
+
+        stripped = line.strip()
+        if stripped and not skip_until_end:
+            filtered_lines.append(line)
+
+    schema_sql = "\n".join(filtered_lines)
+    # Add IF NOT EXISTS back to CREATE TABLE statements
+    schema_sql = schema_sql.replace("CREATE TABLE cache_", "CREATE TABLE IF NOT EXISTS cache_")
+    return schema_sql
 
 
 class CacheServiceBackend:
@@ -48,87 +97,55 @@ class CacheServiceBackend:
 
 
 class SQLiteCacheBackend(CacheServiceBackend):
-    """SQLite backend for cache service."""
+    """SQLite backend for cache service.
+
+    Uses a per-thread connection pool (threading.local) so that concurrent
+    Flask requests each get their own SQLite connection, avoiding
+    'OperationalError: database is locked' errors under load.
+    WAL journal mode is enabled for better read concurrency.
+    """
 
     def __init__(self, db_path: str):
-        import sqlite3
-
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._local = threading.local()
+        self._schema_lock = threading.Lock()
         self._create_schema()
 
+    def _get_conn(self):
+        """Return the per-thread SQLite connection, creating it if needed."""
+        import sqlite3
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return conn
+
     def _create_schema(self):
-        """Create cache database schema."""
-        # Read schema from SQL file
+        """Create cache database schema (run once on the initializing thread)."""
         schema_path = (
             Path(__file__).parent.parent / "database" / "cache_service_schema.sql"
         )
 
-        # For SQLite, we need to adapt the PostgreSQL schema
         with open(schema_path, "r") as f:
             schema_sql = f.read()
 
-        # Simple adaptations for SQLite (order matters!)
-        # Do BIGSERIAL before BIGINT to avoid double replacement
-        schema_sql = schema_sql.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-        schema_sql = schema_sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-        schema_sql = schema_sql.replace("BIGINT", "INTEGER")
-        schema_sql = schema_sql.replace("JSONB", "TEXT")
-        schema_sql = schema_sql.replace("BOOLEAN", "INTEGER")
-        schema_sql = schema_sql.replace("DEFAULT true", "DEFAULT 1")
-        schema_sql = schema_sql.replace("DEFAULT false", "DEFAULT 0")
-        # Keep "IF NOT EXISTS" for tables, but we'll add it back after filtering
-        schema_sql = schema_sql.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+        schema_sql = adapt_postgres_schema_for_sqlite(schema_sql)
 
-        # Remove PostgreSQL-specific functions and views
-        lines = schema_sql.split("\n")
-        filtered_lines = []
-        skip_until_end = False
-        paren_depth = 0
-
-        for line in lines:
-            stripped = line.strip()
-
-            # Start skipping when we encounter a function or view
-            if "CREATE OR REPLACE FUNCTION" in line or "CREATE OR REPLACE VIEW" in line:
-                skip_until_end = True
-                paren_depth = 0
-
-            if skip_until_end:
-                # Track parentheses and $$ delimiters for function bodies
-                if "$$" in line:
-                    # Toggle function body delimiter
-                    if paren_depth == 0:
-                        paren_depth = 1
-                    else:
-                        paren_depth = 0
-                        skip_until_end = False
-                elif line.endswith(";") and paren_depth == 0:
-                    # End of statement
-                    skip_until_end = False
-                continue
-
-            # Keep all other lines
-            if stripped and not skip_until_end:
-                filtered_lines.append(line)
-
-        schema_sql = "\n".join(filtered_lines)
-
-        # Add IF NOT EXISTS back to CREATE TABLE statements
-        schema_sql = schema_sql.replace("CREATE TABLE cache_", "CREATE TABLE IF NOT EXISTS cache_")
-
-        # Execute schema
-        try:
-            self.conn.executescript(schema_sql)
-            self.conn.commit()
-            logger.info("SQLite cache schema created")
-        except Exception as e:
-            logger.error(f"Failed to create schema: {e}")
+        with self._schema_lock:
+            conn = self._get_conn()
+            try:
+                conn.executescript(schema_sql)
+                conn.commit()
+                logger.info("SQLite cache schema created")
+            except Exception as e:
+                logger.error(f"Failed to create schema: {e}")
 
     def _check_session(self, session_id: str) -> bool:
         """Check if session is valid."""
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
         cursor.execute(
             """
             SELECT 1 FROM cache_sessions
@@ -144,9 +161,9 @@ class SQLiteCacheBackend(CacheServiceBackend):
         if not self._check_session(session_id):
             return None, 401
 
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
-        # Update statistics
         cursor.execute(
             """
             UPDATE cache_entries
@@ -160,7 +177,6 @@ class SQLiteCacheBackend(CacheServiceBackend):
             (cache_key,),
         )
 
-        # Get entry
         cursor.execute(
             """
             SELECT execution_id, squid_id, run_db_path, metadata
@@ -173,11 +189,10 @@ class SQLiteCacheBackend(CacheServiceBackend):
         )
 
         row = cursor.fetchone()
-        self.conn.commit()
+        conn.commit()
 
         if row:
             import json
-
             return {
                 "execution_id": row["execution_id"],
                 "squid_id": row["squid_id"],
@@ -193,19 +208,24 @@ class SQLiteCacheBackend(CacheServiceBackend):
 
         import json
 
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
+        # Compute expires_at in Python to avoid SQL injection via f-string formatting.
+        # Use space separator (not T) so SQLite's datetime('now') comparison works.
         expires_at = None
-        if data.get("ttl_seconds"):
-            expires_at = f"datetime('now', '+{data['ttl_seconds']} seconds')"
+        if data.get("ttl_seconds") is not None and data["ttl_seconds"] != "":
+            expires_at = (
+                datetime.utcnow() + timedelta(seconds=int(data["ttl_seconds"]))
+            ).strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute(
-            f"""
+            """
             INSERT OR REPLACE INTO cache_entries (
                 cache_key, simulation_id, simulation_name, simulation_version,
                 execution_id, squid_id, input_hash, run_db_path,
                 expires_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, {expires_at or 'NULL'}, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["cache_key"],
@@ -216,11 +236,12 @@ class SQLiteCacheBackend(CacheServiceBackend):
                 data["squid_id"],
                 data["input_hash"],
                 data["run_db_path"],
+                expires_at,
                 json.dumps(data.get("metadata")) if data.get("metadata") else None,
             ),
         )
 
-        self.conn.commit()
+        conn.commit()
         return {"success": True}, 200
 
     def invalidate(self, filters: dict, session_id: str):
@@ -248,23 +269,21 @@ class SQLiteCacheBackend(CacheServiceBackend):
 
         where_clause = " AND ".join(conditions)
 
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
         cursor.execute(
-            f"""
-            UPDATE cache_entries
-            SET status = 'invalidated'
-            WHERE {where_clause}
-            """,
+            f"UPDATE cache_entries SET status = 'invalidated' WHERE {where_clause}",
             params,
         )
 
         invalidated_count = cursor.rowcount
-        self.conn.commit()
+        conn.commit()
 
         return {"invalidated_count": invalidated_count}, 200
 
     def get_stats(self, simulation_id: Optional[int]):
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         if simulation_id:
             cursor.execute(
@@ -301,18 +320,21 @@ class SQLiteCacheBackend(CacheServiceBackend):
 
     def health_check(self):
         try:
-            cursor = self.conn.cursor()
+            conn = self._get_conn()
+            cursor = conn.cursor()
             cursor.execute("SELECT 1")
             return {"status": "healthy", "backend": "sqlite"}, 200
         except Exception as e:
-            return {"status": "unhealthy", "error": str(e)}, 500
+            logger.error(f"Health check failed: {e}", exc_info=True)
+            return {"status": "unhealthy", "error": "Internal error"}, 500
 
     def list_entries(self, limit=25, offset=0, simulation_id=None, simulation_name=None, status=None, session_id=None):
-        """List cache entries with pagination and filters"""
+        """List cache entries with pagination and filters."""
         if not self._check_session(session_id):
             return {"error": "Unauthorized"}, 401
 
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         conditions = []
         params = []
@@ -325,20 +347,19 @@ class SQLiteCacheBackend(CacheServiceBackend):
             conditions.append("simulation_name = ?")
             params.append(simulation_name)
 
-        if status == 'valid':
+        if status == "valid":
             conditions.append("status = 'valid'")
-        elif status == 'invalidated':
+        elif status == "invalidated":
             conditions.append("status = 'invalidated'")
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # Get total count
         cursor.execute(f"SELECT COUNT(*) FROM cache_entries WHERE {where_clause}", params)
         total = cursor.fetchone()[0]
 
-        # Get entries
         params.extend([limit, offset])
-        cursor.execute(f"""
+        cursor.execute(
+            f"""
             SELECT
                 cache_key, simulation_id, simulation_name, simulation_version,
                 execution_id, squid_id, input_hash, created_at, last_accessed,
@@ -347,7 +368,9 @@ class SQLiteCacheBackend(CacheServiceBackend):
             WHERE {where_clause}
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
-        """, params)
+            """,
+            params,
+        )
 
         entries = []
         for row in cursor.fetchall():
@@ -363,32 +386,44 @@ class SQLiteCacheBackend(CacheServiceBackend):
                 "last_accessed_at": row["last_accessed"],
                 "access_count": row["access_count"],
                 "hit_count": row["hit_count"],
-                "status": row["status"]
+                "status": row["status"],
             })
 
         return {
             "entries": entries,
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }, 200
 
 
 class PostgreSQLCacheBackend(CacheServiceBackend):
-    """PostgreSQL backend for cache service."""
+    """PostgreSQL backend for cache service.
+
+    Uses a per-thread connection pool (threading.local) for thread safety
+    under concurrent Flask requests.
+    """
 
     def __init__(self, connection_string: str, no_auth: bool = False):
-        import psycopg2
-        import psycopg2.extras
-
-        self.conn = psycopg2.connect(connection_string)
-        psycopg2.extras.register_uuid()
+        self.connection_string = connection_string
+        self._local = threading.local()
         self.no_auth = no_auth
         self._create_schema()
 
-        # Create demo session if running in no-auth mode
         if self.no_auth:
             self._create_demo_session()
+
+    def _get_conn(self):
+        """Return the per-thread PostgreSQL connection, creating it if needed."""
+        import psycopg2
+        import psycopg2.extras
+
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg2.connect(self.connection_string)
+            psycopg2.extras.register_uuid()
+            self._local.conn = conn
+        return conn
 
     def _create_schema(self):
         """Create cache database schema."""
@@ -399,16 +434,17 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         with open(schema_path, "r") as f:
             schema_sql = f.read()
 
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
         cursor.execute(schema_sql)
-        self.conn.commit()
+        conn.commit()
         logger.info("PostgreSQL cache schema created")
 
     def _create_demo_session(self):
         """Create demo session for no-auth mode."""
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
-        # Check if demo-session already exists
         cursor.execute(
             "SELECT session_id FROM cache_sessions WHERE session_id = 'demo-session'"
         )
@@ -416,7 +452,6 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             logger.debug("Demo session already exists")
             return
 
-        # Create demo session with write privileges
         cursor.execute(
             """
             INSERT INTO cache_sessions (session_id, user_id, expires_at, access_level, is_valid)
@@ -424,20 +459,20 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             ON CONFLICT (session_id) DO NOTHING
             """
         )
-        self.conn.commit()
+        conn.commit()
         logger.info("Created demo session for no-auth mode")
 
     def get(self, cache_key: str, session_id: str):
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         logger.debug(f"PostgreSQL: Getting cache entry - Key: {cache_key}, Session: {session_id}")
-        # Use the stored function for cache get
         cursor.execute(
             "SELECT * FROM get_cache_entry(%s, %s)", (cache_key, session_id)
         )
 
         row = cursor.fetchone()
-        self.conn.commit()
+        conn.commit()
 
         if row:
             logger.debug(f"PostgreSQL: Cache entry found - Execution ID: {row[0]}")
@@ -453,17 +488,16 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
 
     def set(self, data: dict, session_id: str):
         import json
-        cursor = self.conn.cursor()
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         logger.debug(f"PostgreSQL: Setting cache entry - Key: {data.get('cache_key')}, Session: {session_id}")
-        logger.debug(f"PostgreSQL: Cache data - Sim: {data.get('simulation_name')}, Exec: {data.get('execution_id')}")
 
-        # Convert metadata dict to JSON string for PostgreSQL JSONB
         metadata = data.get("metadata")
         if metadata is not None and isinstance(metadata, dict):
             metadata = json.dumps(metadata)
 
-        # Use the stored function for cache set
         try:
             cursor.execute(
                 """
@@ -484,18 +518,18 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
                 ),
             )
 
-            self.conn.commit()
+            conn.commit()
             logger.debug(f"PostgreSQL: Successfully stored cache entry - Key: {data.get('cache_key')}")
             return {"success": True}, 200
         except Exception as e:
-            self.conn.rollback()
+            conn.rollback()
             logger.error(f"PostgreSQL: Error setting cache entry: {e}", exc_info=True)
             raise
 
     def invalidate(self, filters: dict, session_id: str):
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
-        # Use the stored function for invalidation
         cursor.execute(
             """
             SELECT invalidate_cache(%s, %s, %s, %s, %s, %s)
@@ -511,14 +545,14 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         )
 
         invalidated_count = cursor.fetchone()[0]
-        self.conn.commit()
+        conn.commit()
 
         return {"invalidated_count": invalidated_count}, 200
 
     def get_stats(self, simulation_id: Optional[int]):
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
-        # First try the cache_stats_summary view
         cursor.execute(
             """
             SELECT
@@ -597,15 +631,18 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
 
     def health_check(self):
         try:
-            cursor = self.conn.cursor()
+            conn = self._get_conn()
+            cursor = conn.cursor()
             cursor.execute("SELECT 1")
             return {"status": "healthy", "backend": "postgresql"}, 200
         except Exception as e:
-            return {"status": "unhealthy", "error": str(e)}, 500
+            logger.error(f"Health check failed: {e}", exc_info=True)
+            return {"status": "unhealthy", "error": "Internal error"}, 500
 
     def list_entries(self, limit=25, offset=0, simulation_id=None, simulation_name=None, status=None, session_id=None):
-        """List cache entries with pagination and filters"""
-        cursor = self.conn.cursor()
+        """List cache entries with pagination and filters."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         conditions = []
         params = []
@@ -618,22 +655,21 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             conditions.append("simulation_name = %s")
             params.append(simulation_name)
 
-        if status == 'valid':
+        if status == "valid":
             conditions.append("status = %s")
-            params.append('valid')
-        elif status == 'invalidated':
+            params.append("valid")
+        elif status == "invalidated":
             conditions.append("status = %s")
-            params.append('invalidated')
+            params.append("invalidated")
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        # Get total count
         cursor.execute(f"SELECT COUNT(*) FROM cache_entries WHERE {where_clause}", params)
         total = cursor.fetchone()[0]
 
-        # Get entries
         params.extend([limit, offset])
-        cursor.execute(f"""
+        cursor.execute(
+            f"""
             SELECT
                 cache_key, simulation_id, simulation_name, simulation_version,
                 execution_id, squid_id, input_hash, created_at, last_accessed,
@@ -642,7 +678,9 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             WHERE {where_clause}
             ORDER BY created_at DESC
             LIMIT %s OFFSET %s
-        """, params)
+            """,
+            params,
+        )
 
         entries = []
         for row in cursor.fetchall():
@@ -659,14 +697,14 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
                 "access_count": row[9],
                 "hit_count": row[10],
                 "size_bytes": row[11],
-                "status": row[12]
+                "status": row[12],
             })
 
         return {
             "entries": entries,
             "total": total,
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }, 200
 
 
@@ -679,11 +717,14 @@ def health():
 
 @app.route("/cache/<path:cache_key>", methods=["GET"])
 def get_cache(cache_key):
-    session_id = request.headers.get("X-Session-ID", "demo-session")
-    logger.debug(f"GET /cache/{cache_key} - Session: {session_id}")
+    # Read header first, then check — avoids auth bypass via default value
+    session_id = request.headers.get("X-Session-ID")
     if require_auth and not session_id:
         logger.warning(f"Missing session ID for cache key: {cache_key}")
         return jsonify({"error": "Missing session ID"}), 401
+    session_id = session_id or "demo-session"
+
+    logger.debug(f"GET /cache/{cache_key} - Session: {session_id}")
 
     data, status = cache_db.get(cache_key, session_id)
     if data:
@@ -696,24 +737,23 @@ def get_cache(cache_key):
 
 @app.route("/cache", methods=["POST"])
 def set_cache():
-    session_id = request.headers.get("X-Session-ID", "demo-session")
-    logger.debug(f"POST /cache - Session: {session_id}")
+    # Read header first, then check — avoids auth bypass via default value
+    session_id = request.headers.get("X-Session-ID")
     if require_auth and not session_id:
         logger.warning("Missing session ID for cache set")
         return jsonify({"error": "Missing session ID"}), 401
+    session_id = session_id or "demo-session"
+
+    logger.debug(f"POST /cache - Session: {session_id}")
 
     data = request.json
     logger.debug(f"Setting cache entry: {data.get('cache_key', 'unknown')}")
     try:
         result, status = cache_db.set(data, session_id)
-        if status == 200:
-            logger.debug(f"Successfully stored cache entry: {data.get('cache_key', 'unknown')}")
-        else:
-            logger.warning(f"Failed to store cache entry: {data.get('cache_key', 'unknown')} - Status: {status}")
         return jsonify(result), status
     except Exception as e:
         logger.error(f"Error storing cache entry: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 @app.route("/cache/invalidate", methods=["POST"])
@@ -736,10 +776,12 @@ def get_stats():
 
 @app.route("/cache/entries", methods=["GET"])
 def list_cache_entries():
-    """List all cache entries with pagination and filters"""
-    session_id = request.headers.get("X-Session-ID", "demo-session")
+    """List all cache entries with pagination and filters."""
+    # Read header first, then check — avoids auth bypass via default value
+    session_id = request.headers.get("X-Session-ID")
     if require_auth and not session_id:
         return jsonify({"error": "Missing session ID"}), 401
+    session_id = session_id or "demo-session"
 
     limit = request.args.get("limit", 25, type=int)
     offset = request.args.get("offset", 0, type=int)
@@ -754,12 +796,12 @@ def list_cache_entries():
             simulation_id=simulation_id,
             simulation_name=simulation_name,
             status=status,
-            session_id=session_id
+            session_id=session_id,
         )
         return jsonify(result), http_status
     except Exception as e:
         logger.error(f"Error listing cache entries: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 
 def main():
@@ -789,12 +831,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Set logging level based on --debug flag
     if args.debug:
         logging.basicConfig(
             level=logging.DEBUG,
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            force=True
+            force=True,
         )
         logger.setLevel(logging.DEBUG)
         logger.debug("DEBUG logging enabled")
@@ -803,23 +844,22 @@ def main():
     global require_auth
     require_auth = not args.no_auth
 
-    # Initialize backend
     if args.backend == "sqlite":
         cache_db = SQLiteCacheBackend(args.db_path)
         logger.info(f"Using SQLite backend: {args.db_path}")
 
-        # Create a demo session that never expires when --no-auth is used
         if not require_auth:
             import sqlite3
-            from datetime import datetime, timedelta
             conn = sqlite3.connect(args.db_path)
             cursor = conn.cursor()
-            # Create session that expires in 100 years (effectively never)
             expires_at = (datetime.now() + timedelta(days=36500)).isoformat()
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT OR REPLACE INTO cache_sessions (session_id, user_id, expires_at, access_level, is_valid)
                 VALUES (?, ?, ?, ?, ?)
-            """, ("demo-session", 1, expires_at, 'write', 1))
+                """,
+                ("demo-session", 1, expires_at, "write", 1),
+            )
             conn.commit()
             conn.close()
             logger.info("Created demo session for no-auth mode")
@@ -831,7 +871,6 @@ def main():
         cache_db = PostgreSQLCacheBackend(args.db_url, no_auth=not require_auth)
         logger.info("Using PostgreSQL backend")
 
-    # Start server
     logger.info(f"Starting cache service on {args.host}:{args.port}")
     if not require_auth:
         logger.info("Authentication disabled (--no-auth mode)")

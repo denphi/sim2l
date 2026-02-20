@@ -43,6 +43,8 @@ setup(
         "flask>=2.0",
         "requests>=2.25",
         "psycopg2-binary>=2.9",
+        # Security: password hashing
+        "bcrypt>=4.0",
     ],
     extras_require={
         "dev": [

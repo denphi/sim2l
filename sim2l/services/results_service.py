@@ -9,10 +9,10 @@ Similar to the legacy registerSquidpgSimtool but modernized for sim2l architectu
 
 import os
 import logging
+import threading
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from flask import Flask, request, jsonify
-import hashlib
 
 from ..database.run_database import RunDatabase
 from ..database.session_manager import get_session_manager, Session
@@ -90,25 +90,40 @@ class ResultsBackend:
 
 
 class SQLiteResultsBackend(ResultsBackend):
-    """SQLite implementation of results storage."""
+    """SQLite implementation of results storage.
+
+    Uses a per-thread connection pool (threading.local) so that concurrent
+    Flask requests each get their own SQLite connection, avoiding
+    'OperationalError: database is locked' errors under load.
+    WAL journal mode is enabled for better read concurrency.
+    """
 
     def __init__(self, db_path: str = None):
-        import sqlite3
-        import json
-
         if db_path is None:
             db_path = os.path.expanduser("~/.sim2l/results.db")
 
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._local = threading.local()
+        self._schema_lock = threading.Lock()
         self._initialize_schema()
 
+    def _get_conn(self):
+        """Return the per-thread SQLite connection, creating it if needed."""
+        import sqlite3
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return conn
+
     def _initialize_schema(self):
-        """Initialize SQLite schema."""
-        cursor = self.conn.cursor()
+        """Initialize SQLite schema (run once on the initializing thread)."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         # Simulation schemas table
         cursor.execute("""
@@ -183,7 +198,7 @@ class SQLiteResultsBackend(ResultsBackend):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_simulation ON execution_results(simulation_name, simulation_version)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_squid ON execution_results(squid_id)")
 
-        self.conn.commit()
+        conn.commit()
 
     def register_schema(
         self,
@@ -192,7 +207,8 @@ class SQLiteResultsBackend(ResultsBackend):
         schema_data: Dict[str, Any]
     ) -> int:
         import json
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         schema_json = json.dumps(schema_data)
 
@@ -204,7 +220,7 @@ class SQLiteResultsBackend(ResultsBackend):
                 updated_at = CURRENT_TIMESTAMP
         """, (tool_name, tool_version, schema_json))
 
-        self.conn.commit()
+        conn.commit()
 
         cursor.execute("""
             SELECT id FROM simulation_schemas
@@ -228,7 +244,8 @@ class SQLiteResultsBackend(ResultsBackend):
         metadata: Optional[Dict[str, Any]] = None
     ) -> int:
         import json
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         # Get schema_id
         cursor.execute("""
@@ -257,18 +274,53 @@ class SQLiteResultsBackend(ResultsBackend):
               squid_id, input_json, output_json, status, duration_seconds,
               run_db_path, metadata_json))
 
-        self.conn.commit()
+        conn.commit()
         return cursor.lastrowid
+
+    def _matches_filter(self, value: Any, filter_spec: Any) -> bool:
+        """Check if a value matches a filter specification.
+
+        Filter can be:
+        - Simple value: value == filter_spec
+        - Dict with operators: {'$gt': 100, '$lt': 200}
+        """
+        if isinstance(filter_spec, dict):
+            # Handle comparison operators
+            for op, target in filter_spec.items():
+                if op == '$gt':
+                    if not (value is not None and value > target):
+                        return False
+                elif op == '$gte':
+                    if not (value is not None and value >= target):
+                        return False
+                elif op == '$lt':
+                    if not (value is not None and value < target):
+                        return False
+                elif op == '$lte':
+                    if not (value is not None and value <= target):
+                        return False
+                elif op == '$eq':
+                    if value != target:
+                        return False
+                else:
+                    # Unknown operator, ignore
+                    pass
+            return True
+        else:
+            # Simple equality check
+            return value == filter_spec
 
     def search_results(
         self,
         simulation_name: Optional[str] = None,
+        simulation_version: Optional[str] = None,
+        status: Optional[str] = None,
         input_filters: Optional[Dict[str, Any]] = None,
         output_filters: Optional[Dict[str, Any]] = None,
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         import json
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         query = """
             SELECT execution_id, simulation_name, simulation_version, squid_id,
@@ -281,6 +333,14 @@ class SQLiteResultsBackend(ResultsBackend):
         if simulation_name:
             query += " AND simulation_name = ?"
             params.append(simulation_name)
+
+        if simulation_version:
+            query += " AND simulation_version = ?"
+            params.append(simulation_version)
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
 
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
@@ -301,19 +361,19 @@ class SQLiteResultsBackend(ResultsBackend):
                 'created_at': row['created_at']
             }
 
-            # Filter by input params
+            # Filter by input params (with operator support)
             if input_filters:
                 match = all(
-                    result['input_params'].get(k) == v
+                    self._matches_filter(result['input_params'].get(k), v)
                     for k, v in input_filters.items()
                 )
                 if not match:
                     continue
 
-            # Filter by output params
+            # Filter by output params (with operator support)
             if output_filters:
                 match = all(
-                    result['output_params'].get(k) == v
+                    self._matches_filter(result['output_params'].get(k), v)
                     for k, v in output_filters.items()
                 )
                 if not match:
@@ -325,7 +385,7 @@ class SQLiteResultsBackend(ResultsBackend):
 
     def get_result(self, execution_id: str) -> Optional[Dict[str, Any]]:
         import json
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         cursor.execute("""
             SELECT * FROM execution_results WHERE execution_id = ?
@@ -358,7 +418,7 @@ class SQLiteResultsBackend(ResultsBackend):
         param_class: str = 'output'
     ) -> Dict[str, Any]:
         import json
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         param_column = 'output_params' if param_class == 'output' else 'input_params'
 
@@ -400,7 +460,8 @@ class SQLiteResultsBackend(ResultsBackend):
         error_message: str,
         stack_trace: Optional[str] = None
     ) -> None:
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         cursor.execute("""
             INSERT INTO result_errors (
@@ -410,23 +471,38 @@ class SQLiteResultsBackend(ResultsBackend):
         """, (execution_id, simulation_name, simulation_version,
               error_type, error_message, stack_trace))
 
-        self.conn.commit()
+        conn.commit()
 
 
 class PostgreSQLResultsBackend(ResultsBackend):
-    """PostgreSQL implementation using the results_db_schema.sql schema."""
+    """PostgreSQL implementation using the results_db_schema.sql schema.
+
+    Uses a per-thread connection pool (threading.local) for thread safety
+    under concurrent Flask requests. Uses RealDictCursor for named column
+    access, avoiding fragile positional index mapping.
+    """
 
     def __init__(self, db_url: str):
+        self.db_url = db_url
+        self._local = threading.local()
+        # Initialize schema on the calling thread
+        self._initialize_schema()
+
+    def _get_conn(self):
+        """Return the per-thread PostgreSQL connection, creating it if needed."""
         import psycopg2
         import psycopg2.extras
-        import json
 
-        self.conn = psycopg2.connect(db_url)
-        self.conn.autocommit = False
-        psycopg2.extras.register_json(self.conn, globally=True)
-
-        # Initialize schema
-        self._initialize_schema()
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg2.connect(
+                self.db_url,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+            conn.autocommit = False
+            psycopg2.extras.register_json(conn, globally=False)
+            self._local.conn = conn
+        return conn
 
     def _initialize_schema(self):
         """Initialize PostgreSQL schema from SQL file."""
@@ -442,15 +518,16 @@ class PostgreSQLResultsBackend(ResultsBackend):
         schema_data: Dict[str, Any]
     ) -> int:
         import json
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         cursor.execute("""
             SELECT register_simulation_schema(%s, %s, %s::jsonb)
         """, (tool_name, tool_version, json.dumps(schema_data)))
 
         result = cursor.fetchone()
-        self.conn.commit()
-        return result[0] if result else None
+        conn.commit()
+        return list(result.values())[0] if result else None
 
     def register_result(
         self,
@@ -466,7 +543,8 @@ class PostgreSQLResultsBackend(ResultsBackend):
         metadata: Optional[Dict[str, Any]] = None
     ) -> int:
         import json
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         cursor.execute("""
             SELECT register_execution_result(
@@ -478,22 +556,28 @@ class PostgreSQLResultsBackend(ResultsBackend):
               json.dumps(metadata) if metadata else None))
 
         result = cursor.fetchone()
-        self.conn.commit()
-        return result[0] if result else None
+        conn.commit()
+        return list(result.values())[0] if result else None
 
     def search_results(
         self,
         simulation_name: Optional[str] = None,
+        simulation_version: Optional[str] = None,
+        status: Optional[str] = None,
         input_filters: Optional[Dict[str, Any]] = None,
         output_filters: Optional[Dict[str, Any]] = None,
         limit: int = 100
     ) -> List[Dict[str, Any]]:
         import json
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         cursor.execute("""
-            SELECT * FROM search_results_by_params(%s, %s::jsonb, %s::jsonb, %s)
+            SELECT * FROM search_results_by_params(
+                %s, %s, %s, %s::jsonb, %s::jsonb, %s
+            )
         """, (simulation_name,
+              simulation_version,
+              status,
               json.dumps(input_filters or {}),
               json.dumps(output_filters or {}),
               limit))
@@ -503,20 +587,20 @@ class PostgreSQLResultsBackend(ResultsBackend):
 
         for row in rows:
             results.append({
-                'execution_id': row[0],
-                'simulation_name': row[1],
-                'simulation_version': row[2],
-                'squid_id': row[3],
-                'input_params': row[4],
-                'output_params': row[5],
-                'status': row[6],
-                'created_at': row[7].isoformat() if row[7] else None
+                'execution_id': row['execution_id'],
+                'simulation_name': row['simulation_name'],
+                'simulation_version': row['simulation_version'],
+                'squid_id': row['squid_id'],
+                'input_params': row['input_params'],
+                'output_params': row['output_params'],
+                'status': row['status'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
             })
 
         return results
 
     def get_result(self, execution_id: str) -> Optional[Dict[str, Any]]:
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         cursor.execute("""
             SELECT * FROM execution_results WHERE execution_id = %s
@@ -527,19 +611,19 @@ class PostgreSQLResultsBackend(ResultsBackend):
             return None
 
         return {
-            'id': row[0],
-            'execution_id': row[1],
-            'simulation_name': row[2],
-            'simulation_version': row[3],
-            'squid_id': row[5],
-            'input_params': row[6],
-            'output_params': row[7],
-            'status': row[8],
-            'duration_seconds': row[9],
-            'created_at': row[11].isoformat() if row[11] else None,
-            'completed_at': row[12].isoformat() if row[12] else None,
-            'run_db_path': row[13],
-            'metadata': row[14]
+            'id': row['id'],
+            'execution_id': row['execution_id'],
+            'simulation_name': row['simulation_name'],
+            'simulation_version': row['simulation_version'],
+            'squid_id': row['squid_id'],
+            'input_params': row['input_params'],
+            'output_params': row['output_params'],
+            'status': row['status'],
+            'duration_seconds': row['duration_seconds'],
+            'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+            'completed_at': row['completed_at'].isoformat() if row['completed_at'] else None,
+            'run_db_path': row['run_db_path'],
+            'metadata': row['metadata'],
         }
 
     def get_parameter_stats(
@@ -548,23 +632,23 @@ class PostgreSQLResultsBackend(ResultsBackend):
         param_name: str,
         param_class: str = 'output'
     ) -> Dict[str, Any]:
-        cursor = self.conn.cursor()
+        cursor = self._get_conn().cursor()
 
         cursor.execute("""
             SELECT * FROM get_parameter_statistics(%s, %s, %s)
         """, (simulation_name, param_name, param_class))
 
         row = cursor.fetchone()
-        if not row or row[5] == 0:
+        if not row or row.get('count', row.get('total_count', 0)) == 0:
             return {'param_name': param_name, 'count': 0}
 
         return {
-            'param_name': row[0],
-            'param_type': row[1],
-            'min_value': float(row[2]) if row[2] is not None else None,
-            'max_value': float(row[3]) if row[3] is not None else None,
-            'avg_value': float(row[4]) if row[4] is not None else None,
-            'count': row[5]
+            'param_name': row.get('param_name', param_name),
+            'param_type': row.get('param_type'),
+            'min_value': float(row['min_value']) if row.get('min_value') is not None else None,
+            'max_value': float(row['max_value']) if row.get('max_value') is not None else None,
+            'avg_value': float(row['avg_value']) if row.get('avg_value') is not None else None,
+            'count': row.get('count', row.get('total_count', 0)),
         }
 
     def record_error(
@@ -576,7 +660,8 @@ class PostgreSQLResultsBackend(ResultsBackend):
         error_message: str,
         stack_trace: Optional[str] = None
     ) -> None:
-        cursor = self.conn.cursor()
+        conn = self._get_conn()
+        cursor = conn.cursor()
 
         cursor.execute("""
             INSERT INTO result_errors (
@@ -586,7 +671,7 @@ class PostgreSQLResultsBackend(ResultsBackend):
         """, (execution_id, simulation_name, simulation_version,
               error_type, error_message, stack_trace))
 
-        self.conn.commit()
+        conn.commit()
 
 
 # ============================================================================
@@ -873,16 +958,26 @@ def create_results_service(
 
         data = request.json
         simulation_name = data.get('simulation_name')
+        simulation_version = data.get('simulation_version')
+        status = data.get('status')
         input_filters = data.get('input_filters', {})
         output_filters = data.get('output_filters', {})
         limit = data.get('limit', 100)
 
+        logger.debug(f"Search request - sim: {simulation_name}, version: {simulation_version}, status: {status}")
+        logger.debug(f"Input filters: {input_filters}")
+        logger.debug(f"Output filters: {output_filters}")
+
         results = results_backend.search_results(
             simulation_name=simulation_name,
+            simulation_version=simulation_version,
+            status=status,
             input_filters=input_filters,
             output_filters=output_filters,
             limit=limit
         )
+
+        logger.debug(f"Search returned {len(results)} results")
 
         return jsonify({
             'results': results,

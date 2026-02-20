@@ -329,11 +329,11 @@ class TestSessionManagerPrivilegeChecking:
         self.manager = SessionManager()
         self.manager.create_user("user", "pass", role="user")
         self.manager.create_user("dev", "pass", role="developer")
-        self.manager.create_user("admin", "pass", role="admin")
+        # "admin" already exists as the default admin user (password: "admin")
 
         self.user_session = self.manager.authenticate("user", "pass")
         self.dev_session = self.manager.authenticate("dev", "pass")
-        self.admin_session = self.manager.authenticate("admin", "pass")
+        self.admin_session = self.manager.authenticate("admin", "admin")
 
     def test_check_privilege_read(self):
         """Test checking read privilege."""

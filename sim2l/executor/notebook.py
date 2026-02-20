@@ -17,6 +17,7 @@ from .base import Executor
 from ..definition import SimulationDefinition
 from ..result import ExecutionResult
 from ..utils import compute_squid_id
+from ..utils.serialization import serialize_output_value as _to_value
 from ..config import get_config, get_logger
 
 logger = get_logger()
@@ -263,6 +264,11 @@ class NotebookExecutor(Executor):
             # Convert DB path to absolute path
             db_path = Path(get_config().db_path).resolve()
 
+            # NOTE: os.environ is process-wide and NOT thread-safe.
+            # If two NotebookExecutor.execute() calls run concurrently in the
+            # same process (e.g. via threading), these env vars may race.
+            # Papermill itself spawns a subprocess so the env is forked safely,
+            # but the set/clear window here is not protected by a lock.
             os.environ['SIM2L_EXECUTION_ID'] = result.execution_id
             os.environ['SIM2L_SQUID_ID'] = squid_id
             os.environ['SIM2L_DB_PATH'] = str(db_path)
@@ -498,49 +504,15 @@ class NotebookExecutor(Executor):
 
         config = get_config()
 
-        # Convert outputs to serializable format
-        def to_value(val):
-            """Extract numeric value from Pint quantity, numpy array, or return as-is"""
-            import numpy as np
-
-            # Handle Pint quantities
-            if hasattr(val, 'magnitude'):
-                val = val.magnitude
-
-            # Handle numpy arrays
-            if isinstance(val, np.ndarray):
-                return val.tolist()
-
-            # Handle numpy scalars
-            if isinstance(val, (np.integer, np.floating)):
-                return val.item()
-
-            # Handle regular numbers
-            if isinstance(val, (int, float)):
-                return float(val)
-
-            # Handle strings and booleans
-            if isinstance(val, (str, bool)):
-                return val
-
-            # For anything else, try to convert to string
-            return str(val)
-
-        # Serialize outputs
+        # Serialize outputs and inputs using the shared helper
         outputs_dict = {}
         if result.outputs:
             for key, value in result.outputs.to_dict().items():
-                outputs_dict[key] = to_value(value)
+                outputs_dict[key] = _to_value(value)
 
-        # Serialize inputs
         inputs_dict = {}
         for key, value in inputs.items():
-            inputs_dict[key] = to_value(value)
-
-        # Call results service API directly with parameters
-        # Since NotebookExecutor doesn't use RunDatabase, we can't use the /register endpoint
-        # Instead, we'll call the backend's register_result method directly via a new endpoint
-        # For now, we'll use direct HTTP to the results service
+            inputs_dict[key] = _to_value(value)
 
         response = requests.post(
             f"{config.results_service_url.rstrip('/')}/register_direct",
@@ -587,44 +559,15 @@ class NotebookExecutor(Executor):
             logger.debug("Results database not found, skipping registration")
             return
 
-        # Convert outputs to serializable format
-        def to_value(val):
-            """Extract numeric value from Pint quantity, numpy array, or return as-is"""
-            import numpy as np
-
-            # Handle Pint quantities
-            if hasattr(val, 'magnitude'):
-                val = val.magnitude
-
-            # Handle numpy arrays
-            if isinstance(val, np.ndarray):
-                return val.tolist()
-
-            # Handle numpy scalars
-            if isinstance(val, (np.integer, np.floating)):
-                return val.item()
-
-            # Handle regular numbers
-            if isinstance(val, (int, float)):
-                return float(val)
-
-            # Handle strings and booleans
-            if isinstance(val, (str, bool)):
-                return val
-
-            # For anything else, try to convert to string
-            return str(val)
-
-        # Serialize outputs
+        # Serialize outputs and inputs using the shared helper
         outputs_dict = {}
         if result.outputs:
             for key, value in result.outputs.to_dict().items():
-                outputs_dict[key] = to_value(value)
+                outputs_dict[key] = _to_value(value)
 
-        # Serialize inputs
         inputs_dict = {}
         for key, value in inputs.items():
-            inputs_dict[key] = to_value(value)
+            inputs_dict[key] = _to_value(value)
 
         # Insert into results database
         conn = sqlite3.connect(str(results_db_path))

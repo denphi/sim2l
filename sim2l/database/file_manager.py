@@ -551,27 +551,19 @@ class FileManager:
         """
         Search for files/folders matching criteria.
 
-        Note: This is a simple implementation. For production use,
-        consider maintaining a search index or using the catalog service.
+        Not implemented: the cache service does not support arbitrary queries.
+        To search files, either:
+          1. Maintain a separate index of file IDs.
+          2. Use the catalog service.
+          3. Track file IDs in your own data structure.
 
-        Args:
-            name_pattern: File name pattern (substring match)
-            creator: Creator username
-            is_folder: Filter by folder status
-            parent_id: Filter by parent folder
-
-        Returns:
-            List of matching files/folders
+        Raises:
+            NotImplementedError: Always.
         """
-        # This is a placeholder - cache service doesn't support
-        # arbitrary queries. For production, you'd want to either:
-        # 1. Maintain a separate index
-        # 2. Use the catalog service
-        # 3. Keep a registry of all file IDs
-
-        # For now, return empty list
-        # Users should track file IDs separately or use catalog service
-        return []
+        raise NotImplementedError(
+            "search() is not implemented for cache-backed FileManager. "
+            "Use the catalog service or maintain a separate file index."
+        )
 
     def _add_to_folder(self, folder_id: str, object_id: str) -> bool:
         """Add an object to a folder's objects list."""

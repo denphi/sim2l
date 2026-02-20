@@ -192,6 +192,7 @@ export function Cache() {
                 <TableRow>
                   <TableCell>Simulation</TableCell>
                   <TableCell>Version</TableCell>
+                  <TableCell>SQUID ID</TableCell>
                   <TableCell>Status</TableCell>
                   <TableCell align="right">Accesses</TableCell>
                   <TableCell align="right">Hits</TableCell>
@@ -203,7 +204,7 @@ export function Cache() {
               <TableBody>
                 {entries.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center">
+                    <TableCell colSpan={9} align="center">
                       <Typography color="textSecondary" py={4}>
                         No cache entries found
                       </Typography>
@@ -221,6 +222,22 @@ export function Cache() {
                         </Typography>
                       </TableCell>
                       <TableCell>{entry.simulation_version}</TableCell>
+                      <TableCell>
+                        <Tooltip title="Unique SQUID identifier for the execution params">
+                          <Typography
+                            variant="body2"
+                            fontFamily="monospace"
+                            fontWeight="bold"
+                            sx={{
+                              cursor: 'pointer',
+                              '&:hover': { color: 'primary.main' }
+                            }}
+                            onClick={() => navigator.clipboard.writeText(entry.squid_id || '')}
+                          >
+                            {entry.squid_id ? `${entry.squid_id.substring(0, 8)}...` : 'N/A'}
+                          </Typography>
+                        </Tooltip>
+                      </TableCell>
                       <TableCell>
                         <Chip
                           icon={entry.status === 'valid' ? <CheckCircleIcon /> : <CancelIcon />}

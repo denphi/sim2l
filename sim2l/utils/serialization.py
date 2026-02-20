@@ -6,6 +6,47 @@ import numpy as np
 from typing import Any
 
 
+def serialize_for_hashing(value: Any) -> Any:
+    """Convert value to a JSON-serializable primitive for hashing/caching.
+
+    Handles:
+    - Pint Quantity objects → magnitude (units discarded for hash key)
+    - NumPy arrays → nested Python lists
+    - NumPy scalars → Python int/float
+    - Lists/tuples → lists (recursively processed)
+    - Dicts → dicts (recursively processed)
+    - All other types returned unchanged
+    """
+    if hasattr(value, 'magnitude'):
+        return serialize_for_hashing(value.magnitude)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [serialize_for_hashing(v) for v in value]
+    if isinstance(value, dict):
+        return {k: serialize_for_hashing(v) for k, v in value.items()}
+    return value
+
+
+def serialize_output_value(value: Any) -> Any:
+    """Convert a simulation output value to a JSON-serializable form.
+
+    Used when serializing outputs for storage or API transmission.
+    Handles Pint quantities, NumPy types, and falls back to str().
+    """
+    if hasattr(value, 'magnitude'):
+        value = value.magnitude
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, (int, float, str, bool)):
+        return value
+    return str(value)
+
+
 class JsonEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles NumPy arrays and other types"""
 

@@ -8,10 +8,15 @@ outputs, files, logs, and metadata for that run.
 import os
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 import logging
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as a naive datetime (DB-compatible)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +111,7 @@ class RunDatabase:
                 simulation_name,
                 simulation_version,
                 simulation_id,
-                datetime.utcnow(),
+                _utcnow(),
                 "running",
                 executor_type,
                 json.dumps(executor_config) if executor_config else None,
@@ -150,7 +155,7 @@ class RunDatabase:
             WHERE execution_id = ?
             """,
             (
-                datetime.utcnow(),
+                _utcnow(),
                 status,
                 duration_seconds,
                 error_message,
@@ -265,17 +270,21 @@ class RunDatabase:
 
         cursor = self.conn.cursor()
 
-        # Compute content hash if content provided
+        # Compute content hash
         content_hash = None
         size_bytes = None
         if content:
             content_hash = hashlib.sha256(content).hexdigest()
             size_bytes = len(content)
         elif external_path and os.path.exists(external_path):
+            # Use chunked reads to avoid loading large files entirely into memory
+            hasher = hashlib.sha256()
+            size_bytes = 0
             with open(external_path, "rb") as f:
-                file_content = f.read()
-                content_hash = hashlib.sha256(file_content).hexdigest()
-                size_bytes = len(file_content)
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
+                    size_bytes += len(chunk)
+            content_hash = hasher.hexdigest()
 
         cursor.execute(
             """
@@ -524,15 +533,23 @@ class RunDatabase:
     def get_logs(
         self, level: Optional[str] = None, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Get logs, optionally filtered by level."""
+        """Get logs, optionally filtered by level and limited to `limit` rows."""
         cursor = self.conn.cursor()
 
+        params: list = []
+        query = "SELECT * FROM logs"
+
         if level:
-            query = "SELECT * FROM logs WHERE level = ? ORDER BY timestamp DESC"
-            cursor.execute(query, (level,))
-        else:
-            query = "SELECT * FROM logs ORDER BY timestamp DESC"
-            cursor.execute(query)
+            query += " WHERE level = ?"
+            params.append(level)
+
+        query += " ORDER BY timestamp DESC"
+
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor.execute(query, params)
 
         logs = []
         for row in cursor.fetchall():
@@ -549,9 +566,6 @@ class RunDatabase:
                     "stack_trace": row["stack_trace"],
                 }
             )
-
-            if limit and len(logs) >= limit:
-                break
 
         return logs
 

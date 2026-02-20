@@ -244,8 +244,74 @@ $$ LANGUAGE plpgsql;
 
 -- Function: search_results_by_params
 -- Search execution results by parameter values
+-- Helper function to check if a JSONB value matches a filter with operators
+CREATE OR REPLACE FUNCTION matches_jsonb_filter(
+    params JSONB,
+    filters JSONB
+) RETURNS BOOLEAN AS $$
+DECLARE
+    filter_key TEXT;
+    filter_value JSONB;
+    param_value JSONB;
+    operator_key TEXT;
+    operator_value JSONB;
+BEGIN
+    -- If filters is empty, match all
+    IF filters = '{}'::JSONB THEN
+        RETURN TRUE;
+    END IF;
+
+    -- Check each filter
+    FOR filter_key, filter_value IN SELECT * FROM jsonb_each(filters) LOOP
+        param_value := params -> filter_key;
+
+        -- If parameter doesn't exist, no match
+        IF param_value IS NULL THEN
+            RETURN FALSE;
+        END IF;
+
+        -- Check if filter_value is an operator object (e.g., {"$gt": 100})
+        IF jsonb_typeof(filter_value) = 'object' THEN
+            -- Handle comparison operators
+            FOR operator_key, operator_value IN SELECT * FROM jsonb_each(filter_value) LOOP
+                IF operator_key = '$gt' THEN
+                    IF NOT ((param_value)::numeric > (operator_value)::numeric) THEN
+                        RETURN FALSE;
+                    END IF;
+                ELSIF operator_key = '$gte' THEN
+                    IF NOT ((param_value)::numeric >= (operator_value)::numeric) THEN
+                        RETURN FALSE;
+                    END IF;
+                ELSIF operator_key = '$lt' THEN
+                    IF NOT ((param_value)::numeric < (operator_value)::numeric) THEN
+                        RETURN FALSE;
+                    END IF;
+                ELSIF operator_key = '$lte' THEN
+                    IF NOT ((param_value)::numeric <= (operator_value)::numeric) THEN
+                        RETURN FALSE;
+                    END IF;
+                ELSIF operator_key = '$eq' THEN
+                    IF param_value != operator_value THEN
+                        RETURN FALSE;
+                    END IF;
+                END IF;
+            END LOOP;
+        ELSE
+            -- Simple equality check
+            IF param_value != filter_value THEN
+                RETURN FALSE;
+            END IF;
+        END IF;
+    END LOOP;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE OR REPLACE FUNCTION search_results_by_params(
     p_simulation_name VARCHAR(255) DEFAULT NULL,
+    p_simulation_version VARCHAR(50) DEFAULT NULL,
+    p_status VARCHAR(50) DEFAULT NULL,
     p_input_filters JSONB DEFAULT '{}'::JSONB,
     p_output_filters JSONB DEFAULT '{}'::JSONB,
     p_limit INTEGER DEFAULT 100
@@ -273,8 +339,10 @@ BEGIN
     FROM execution_results er
     WHERE
         (p_simulation_name IS NULL OR er.simulation_name = p_simulation_name)
-        AND (p_input_filters = '{}'::JSONB OR er.input_params @> p_input_filters)
-        AND (p_output_filters = '{}'::JSONB OR er.output_params @> p_output_filters)
+        AND (p_simulation_version IS NULL OR er.simulation_version = p_simulation_version)
+        AND (p_status IS NULL OR er.status = p_status)
+        AND matches_jsonb_filter(er.input_params, p_input_filters)
+        AND matches_jsonb_filter(er.output_params, p_output_filters)
     ORDER BY er.created_at DESC
     LIMIT p_limit;
 END;
