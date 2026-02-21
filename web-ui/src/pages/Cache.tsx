@@ -24,6 +24,7 @@ import {
   Refresh as RefreshIcon,
   CheckCircle as CheckCircleIcon,
   Cancel as CancelIcon,
+  Delete as DeleteIcon,
 } from '@mui/icons-material';
 import { cacheService } from '../api/cacheService';
 import type { CacheEntry, CacheStats } from '../types/cache';
@@ -37,6 +38,7 @@ export function Cache() {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'valid' | 'invalidated'>('all');
+  const [deletingCacheKey, setDeletingCacheKey] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
@@ -79,16 +81,42 @@ export function Cache() {
     loadData();
   };
 
+  const handleDeleteEntry = async (entry: CacheEntry) => {
+    const confirmed = window.confirm(
+      `Delete cache entry "${entry.cache_key}" for ${entry.simulation_name}/${entry.simulation_version}?`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingCacheKey(entry.cache_key);
+    try {
+      await cacheService.deleteEntry(entry.cache_key);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to delete cache entry:', error);
+      window.alert('Failed to delete cache entry. See browser console for details.');
+    } finally {
+      setDeletingCacheKey(null);
+    }
+  };
+
   const formatDate = (dateStr: string) => {
     const date = new Date(dateStr);
     return date.toLocaleString();
   };
 
-  const formatSize = (bytes: number | null) => {
+  const formatSize = (bytes: number | null | undefined) => {
     if (!bytes) return 'N/A';
     const mb = bytes / (1024 * 1024);
     if (mb < 1) return `${(bytes / 1024).toFixed(2)} KB`;
     return `${mb.toFixed(2)} MB`;
+  };
+
+  const formatSquidId = (entry: CacheEntry) => {
+    if (!entry.squid_id) return 'N/A';
+    if (entry.squid_id.includes('/')) return entry.squid_id;
+    return `${entry.simulation_name}/${entry.simulation_version}/${entry.squid_id}`;
   };
 
   return (
@@ -199,68 +227,86 @@ export function Cache() {
                   <TableCell align="right">Size</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Accessed</TableCell>
+                  <TableCell align="center">Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {entries.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={10} align="center">
                       <Typography color="textSecondary" py={4}>
                         No cache entries found
                       </Typography>
                     </TableCell>
                   </TableRow>
                 ) : (
-                  entries.map((entry) => (
-                    <TableRow key={entry.cache_key} hover>
-                      <TableCell>
-                        <Typography variant="body2" fontWeight="medium">
-                          {entry.simulation_name}
-                        </Typography>
-                        <Typography variant="caption" color="textSecondary" sx={{ display: 'block', mt: 0.5 }}>
-                          ID: {entry.simulation_id}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>{entry.simulation_version}</TableCell>
-                      <TableCell>
-                        <Tooltip title="Unique SQUID identifier for the execution params">
-                          <Typography
-                            variant="body2"
-                            fontFamily="monospace"
-                            fontWeight="bold"
-                            sx={{
-                              cursor: 'pointer',
-                              '&:hover': { color: 'primary.main' }
-                            }}
-                            onClick={() => navigator.clipboard.writeText(entry.squid_id || '')}
-                          >
-                            {entry.squid_id ? `${entry.squid_id.substring(0, 8)}...` : 'N/A'}
+                  entries.map((entry) => {
+                    const fullSquidId = formatSquidId(entry);
+                    return (
+                      <TableRow key={entry.cache_key} hover>
+                        <TableCell>
+                          <Typography variant="body2" fontWeight="medium">
+                            {entry.simulation_name}
                           </Typography>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          icon={entry.status === 'valid' ? <CheckCircleIcon /> : <CancelIcon />}
-                          label={entry.status}
-                          color={entry.status === 'valid' ? 'success' : 'error'}
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell align="right">{entry.access_count}</TableCell>
-                      <TableCell align="right">{entry.hit_count}</TableCell>
-                      <TableCell align="right">{formatSize(entry.size_bytes)}</TableCell>
-                      <TableCell>
-                        <Typography variant="body2">
-                          {formatDate(entry.created_at)}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2">
-                          {entry.last_accessed_at ? formatDate(entry.last_accessed_at) : 'Never'}
-                        </Typography>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                          <Typography variant="caption" color="textSecondary" sx={{ display: 'block', mt: 0.5 }}>
+                            ID: {entry.simulation_id}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>{entry.simulation_version}</TableCell>
+                        <TableCell>
+                          <Tooltip title="Unique SQUID identifier for the execution params">
+                            <Typography
+                              variant="body2"
+                              fontFamily="monospace"
+                              fontWeight="bold"
+                              sx={{
+                                cursor: 'pointer',
+                                '&:hover': { color: 'primary.main' }
+                              }}
+                              onClick={() => fullSquidId !== 'N/A' && navigator.clipboard.writeText(fullSquidId)}
+                            >
+                              {fullSquidId}
+                            </Typography>
+                          </Tooltip>
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            icon={entry.status === 'valid' ? <CheckCircleIcon /> : <CancelIcon />}
+                            label={entry.status}
+                            color={entry.status === 'valid' ? 'success' : 'error'}
+                            size="small"
+                          />
+                        </TableCell>
+                        <TableCell align="right">{entry.access_count}</TableCell>
+                        <TableCell align="right">{entry.hit_count}</TableCell>
+                        <TableCell align="right">{formatSize(entry.size_bytes)}</TableCell>
+                        <TableCell>
+                          <Typography variant="body2">
+                            {formatDate(entry.created_at)}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>
+                          <Typography variant="body2">
+                            {entry.last_accessed_at ? formatDate(entry.last_accessed_at) : 'Never'}
+                          </Typography>
+                        </TableCell>
+                        <TableCell align="center">
+                          <Tooltip title="Delete cache entry">
+                            <span>
+                              <IconButton
+                                color="error"
+                                size="small"
+                                onClick={() => handleDeleteEntry(entry)}
+                                disabled={deletingCacheKey === entry.cache_key}
+                              >
+                                <DeleteIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })
                 )}
               </TableBody>
             </Table>

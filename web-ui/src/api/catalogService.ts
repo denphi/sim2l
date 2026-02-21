@@ -6,6 +6,8 @@ import type {
   ExecutionStats,
   SyncRequest,
   OverviewStats,
+  RunRequest,
+  RunResponse,
 } from '../types/catalog';
 
 export class CatalogServiceClient {
@@ -26,6 +28,26 @@ export class CatalogServiceClient {
     const params = version ? { version } : {};
     const response = await apiClient.catalog.get<Simulation>(`/simulations/${name}`, { params });
     return response.data;
+  }
+
+  async deleteSimulation(simulationId: number): Promise<{
+    status: string;
+    simulation_id: number;
+    name?: string;
+    version?: string;
+  }> {
+    const response = await apiClient.catalog.delete<{
+      status?: string;
+      simulation_id?: number;
+      name?: string;
+      version?: string;
+    }>(`/simulations/${simulationId}`);
+    return {
+      status: response.data.status || 'deleted',
+      simulation_id: response.data.simulation_id || simulationId,
+      name: response.data.name,
+      version: response.data.version,
+    };
   }
 
   async getExecutionStats(simulationId: number): Promise<ExecutionStats> {
@@ -94,6 +116,19 @@ export class CatalogServiceClient {
         total_executions: 0,
         successful_executions: 0,
         cached_executions: 0,
+      };
+    };
+  }
+
+  async submitRun(request: RunRequest): Promise<RunResponse> {
+    try {
+      const response = await apiClient.catalog.post<RunResponse>('/run', request);
+      return response.data;
+    } catch (error: any) {
+      console.error('Error submitting run:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.message || 'Failed to submit run',
       };
     }
   }

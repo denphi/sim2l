@@ -49,6 +49,16 @@ export class CacheServiceClient {
     return response.data;
   }
 
+  async deleteEntry(cacheKey: string): Promise<{ status: string; cache_key: string }> {
+    const response = await apiClient.cache.delete<{ status?: string; cache_key?: string }>(
+      `/cache/${encodeURIComponent(cacheKey)}`
+    );
+    return {
+      status: response.data.status || 'deleted',
+      cache_key: response.data.cache_key || cacheKey,
+    };
+  }
+
   async getHotEntries(limit: number = 10): Promise<{ entries: CacheEntry[] }> {
     try {
       const response = await apiClient.cache.get<{ entries: CacheEntry[] }>('/cache/hot', {

@@ -9,6 +9,7 @@ export interface Simulation {
   organization?: string;
   tags?: string[];
   status: 'active' | 'deprecated' | 'archived';
+  input_schema?: Record<string, any>;
   created_at: string;
   updated_at: string;
 }
@@ -49,4 +50,20 @@ export interface OverviewStats {
   total_executions: number;
   successful_executions: number;
   cached_executions: number;
+}
+
+export interface RunRequest {
+  simulation_name: string;
+  version?: string;
+  params: Record<string, any>;
+}
+
+export interface RunResponse {
+  success: boolean;
+  execution_id?: string;
+  squid_id?: string;
+  status?: string;
+  duration_seconds?: number;
+  outputs?: Record<string, any>;
+  error?: string;
 }

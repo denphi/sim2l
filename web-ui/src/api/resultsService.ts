@@ -6,6 +6,8 @@ import type {
   ResultsListResponse,
   SimulationSchema,
   SearchFilters,
+  RunRequest,
+  RunResponse,
 } from '../types/results';
 
 export class ResultsServiceClient {
@@ -24,6 +26,16 @@ export class ResultsServiceClient {
     return response.data;
   }
 
+  async deleteResult(executionId: string): Promise<{ status: string; execution_id: string }> {
+    const response = await apiClient.results.delete<{ status?: string; execution_id?: string }>(
+      `/results/${encodeURIComponent(executionId)}`
+    );
+    return {
+      status: response.data.status || 'deleted',
+      execution_id: response.data.execution_id || executionId,
+    };
+  }
+
   async getParameterStats(simulationName: string, paramName: string): Promise<ParameterStats> {
     const response = await apiClient.results.get<ParameterStats>(
       `/stats/${simulationName}/${paramName}`
@@ -40,21 +52,16 @@ export class ResultsServiceClient {
     input_filters?: Record<string, any>;
     output_filters?: Record<string, any>;
   } = {}): Promise<ResultsListResponse> {
-    try {
-      const response = await apiClient.results.get<ResultsListResponse>('/results', { params });
-      return response.data;
-    } catch (error) {
-      console.warn('List results endpoint not available, using search');
-      // Convert params to search filters format
-      return this.searchResults({
-        simulation_name: params.simulation,
-        simulation_version: params.version,
-        status: params.status,
-        input_filters: params.input_filters,
-        output_filters: params.output_filters,
-        limit: params.limit || 100,
-      });
-    }
+    // Results service currently provides POST /search for listing/filtering.
+    // Call it directly to avoid expected 404 noise from probing GET /results.
+    return this.searchResults({
+      simulation_name: params.simulation,
+      simulation_version: params.version,
+      status: params.status,
+      input_filters: params.input_filters,
+      output_filters: params.output_filters,
+      limit: params.limit || 100,
+    });
   }
 
   async getSchemas(): Promise<{ schemas: SimulationSchema[] }> {
@@ -89,6 +96,19 @@ export class ResultsServiceClient {
     } catch (error) {
       console.warn('All parameter stats endpoint not available');
       return { stats: [] };
+    }
+  }
+
+  async submitRun(request: RunRequest): Promise<RunResponse> {
+    try {
+      const response = await apiClient.results.post<RunResponse>('/run', request);
+      return response.data;
+    } catch (error: any) {
+      console.error('Error submitting run:', error);
+      return {
+        success: false,
+        error: error.response?.data?.error || error.message || 'Failed to submit run',
+      };
     }
   }
 }

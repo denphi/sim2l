@@ -16,6 +16,7 @@ import {
   CircularProgress,
   IconButton,
   Tooltip,
+  Button,
   Card,
   CardContent,
 } from '@mui/material';
@@ -24,8 +25,10 @@ import {
   CheckCircle as CheckCircleIcon,
   Pause as PauseIcon,
   Error as ErrorIcon,
+  Delete as DeleteIcon,
 } from '@mui/icons-material';
 import { catalogService } from '../api/catalogService';
+import { SubmitRunModal } from '../components/catalog/SubmitRunModal';
 import type { Simulation, OverviewStats } from '../types/catalog';
 
 export function Catalog() {
@@ -33,6 +36,17 @@ export function Catalog() {
   const [stats, setStats] = useState<OverviewStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+
+  const [runModalOpen, setRunModalOpen] = useState(false);
+  const [selectedSimName, setSelectedSimName] = useState('');
+  const [selectedSimVersion, setSelectedSimVersion] = useState<string | undefined>(undefined);
+  const [deletingSimulationId, setDeletingSimulationId] = useState<number | null>(null);
+
+  const handleOpenRunModal = (name: string, version: string) => {
+    setSelectedSimName(name);
+    setSelectedSimVersion(version);
+    setRunModalOpen(true);
+  };
 
   useEffect(() => {
     loadData();
@@ -63,6 +77,26 @@ export function Catalog() {
 
   const handleSearch = () => {
     loadData();
+  };
+
+  const handleDeleteSimulation = async (sim: Simulation) => {
+    const confirmed = window.confirm(
+      `Delete simulation "${sim.name}" version "${sim.version}" from catalog?`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingSimulationId(sim.id);
+    try {
+      await catalogService.deleteSimulation(sim.id);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to delete simulation:', error);
+      window.alert('Failed to delete simulation. See browser console for details.');
+    } finally {
+      setDeletingSimulationId(null);
+    }
   };
 
   const formatDate = (dateStr?: string) => {
@@ -195,12 +229,13 @@ export function Catalog() {
                   <TableCell>Author</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Updated</TableCell>
+                  <TableCell align="center">Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {simulations.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} align="center">
+                    <TableCell colSpan={8} align="center">
                       <Typography color="textSecondary" py={4}>
                         {searchTerm
                           ? 'No simulations found matching your search'
@@ -246,6 +281,30 @@ export function Catalog() {
                       <TableCell>
                         <Typography variant="body2">{formatDate(sim.updated_at)}</Typography>
                       </TableCell>
+                      <TableCell align="center">
+                        <Box display="flex" gap={1} justifyContent="center" alignItems="center">
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => handleOpenRunModal(sim.name, sim.version)}
+                            disabled={sim.status !== 'active' || deletingSimulationId === sim.id}
+                          >
+                            Run
+                          </Button>
+                          <Tooltip title="Delete simulation">
+                            <span>
+                              <IconButton
+                                color="error"
+                                size="small"
+                                onClick={() => handleDeleteSimulation(sim)}
+                                disabled={deletingSimulationId === sim.id}
+                              >
+                                <DeleteIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        </Box>
+                      </TableCell>
                     </TableRow>
                   ))
                 )}
@@ -269,6 +328,13 @@ export function Catalog() {
           </CardContent>
         </Card>
       )}
+
+      <SubmitRunModal
+        open={runModalOpen}
+        onClose={() => setRunModalOpen(false)}
+        simulationName={selectedSimName}
+        simulationVersion={selectedSimVersion}
+      />
     </Container>
   );
 }

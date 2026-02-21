@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
 from datetime import datetime
+import sim2l
+from sim2l.executor import LocalExecutor, NotebookExecutor
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -92,6 +94,9 @@ class CatalogServiceBackend:
         raise NotImplementedError
 
     def update_simulation(self, simulation_id, updates, session_id):
+        raise NotImplementedError
+
+    def delete_simulation(self, simulation_id, session_id):
         raise NotImplementedError
 
     def record_execution(self, data):
@@ -379,6 +384,59 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         conn.commit()
         return {"status": "updated"}, 200
 
+    def delete_simulation(self, simulation_id, session_id):
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, name, version FROM simulations WHERE id = ?",
+            (simulation_id,),
+        )
+        simulation = cursor.fetchone()
+        if not simulation:
+            return {"error": "Simulation not found"}, 404
+
+        # execution_registry does not cascade on simulation delete in this schema.
+        cleanup_statements = [
+            ("DELETE FROM execution_registry WHERE simulation_id = ?", (simulation_id,)),
+            ("DELETE FROM execution_stats WHERE simulation_id = ?", (simulation_id,)),
+            ("DELETE FROM simulation_tags WHERE simulation_id = ?", (simulation_id,)),
+            ("DELETE FROM access_control WHERE simulation_id = ?", (simulation_id,)),
+            (
+                "DELETE FROM simulation_dependencies WHERE simulation_id = ? OR depends_on_simulation_id = ?",
+                (simulation_id, simulation_id),
+            ),
+        ]
+        for statement, params in cleanup_statements:
+            try:
+                cursor.execute(statement, params)
+            except Exception as exc:
+                # Backward compatibility for older SQLite DBs that may miss optional tables.
+                if "no such table" in str(exc).lower():
+                    logger.debug(f"Skipping cleanup statement due to missing table: {statement}")
+                else:
+                    raise
+
+        cursor.execute("DELETE FROM simulations WHERE id = ?", (simulation_id,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {"error": "Simulation not found"}, 404
+
+        logger.info(
+            f"Deleted simulation {simulation['name']}/{simulation['version']} (ID: {simulation_id})"
+        )
+        return {
+            "status": "deleted",
+            "simulation_id": simulation_id,
+            "name": simulation["name"],
+            "version": simulation["version"],
+        }, 200
+
     def record_execution(self, data):
         import json
         conn = self._get_conn()
@@ -589,11 +647,13 @@ def get_simulation(name):
 
 @app.route("/simulations", methods=["POST"])
 def register_simulation():
-    # Read header first, then check — avoids auth bypass via default value
     session_id = request.headers.get("X-Session-ID")
-    if require_auth and not session_id:
-        return jsonify({"error": "Missing session ID"}), 401
-    session_id = session_id or "no-auth-session"
+    if require_auth:
+        if not session_id:
+            return jsonify({"error": "Missing session ID"}), 401
+    else:
+        # In no-auth mode, always use elevated local session regardless of header value.
+        session_id = "no-auth-session"
 
     data = request.json
     result, status = catalog_db.register_simulation(data, session_id)
@@ -602,14 +662,30 @@ def register_simulation():
 
 @app.route("/simulations/<int:simulation_id>", methods=["PATCH"])
 def update_simulation(simulation_id):
-    # Read header first, then check — avoids auth bypass via default value
     session_id = request.headers.get("X-Session-ID")
-    if require_auth and not session_id:
-        return jsonify({"error": "Missing session ID"}), 401
-    session_id = session_id or "no-auth-session"
+    if require_auth:
+        if not session_id:
+            return jsonify({"error": "Missing session ID"}), 401
+    else:
+        # In no-auth mode, always use elevated local session regardless of header value.
+        session_id = "no-auth-session"
 
     updates = request.json
     result, status = catalog_db.update_simulation(simulation_id, updates, session_id)
+    return jsonify(result), status
+
+
+@app.route("/simulations/<int:simulation_id>", methods=["DELETE"])
+def delete_simulation(simulation_id):
+    session_id = request.headers.get("X-Session-ID")
+    if require_auth:
+        if not session_id:
+            return jsonify({"error": "Missing session ID"}), 401
+    else:
+        # In no-auth mode, always use elevated local session regardless of header value.
+        session_id = "no-auth-session"
+
+    result, status = catalog_db.delete_simulation(simulation_id, session_id)
     return jsonify(result), status
 
 
@@ -618,6 +694,79 @@ def record_execution():
     data = request.json
     result, status = catalog_db.record_execution(data)
     return jsonify(result), status
+
+
+@app.route("/run", methods=["POST"])
+def run_simulation():
+    """Run a simulation and return the execution results."""
+    # Read header first, then check — avoids auth bypass via default value
+    session_id = request.headers.get("X-Session-ID")
+    if require_auth and not session_id:
+        return jsonify({"error": "Missing session ID"}), 401
+
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No JSON payload provided'}), 400
+
+    simulation_name = data.get('simulation_name')
+    version = data.get('version')
+    params = data.get('params', {})
+
+    if not simulation_name:
+        return jsonify({'error': 'simulation_name is required'}), 400
+
+    try:
+        # Load the simulation
+        sim = sim2l.load_simulation(simulation_name, version=version)
+        
+        # Use appropriate executor based on workflow type
+        if getattr(sim, 'workflow_type', 'python') == 'notebook':
+            executor = NotebookExecutor(cache=True)
+        else:
+            executor = LocalExecutor(cache=True)
+        
+        # Run simulation
+        import time
+        start_time = time.time()
+        result = sim.run(**params, executor=executor)
+        elapsed_time = time.time() - start_time
+        
+        # Format the output to return
+        outputs = result.outputs.dict() if hasattr(result.outputs, 'dict') else result.outputs
+        if hasattr(outputs, '__dict__'):
+            outputs = vars(outputs)
+            
+        def make_serializable(obj):
+            import numpy as np
+            if isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [make_serializable(v) for v in obj]
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            return obj
+
+        outputs = make_serializable(outputs)
+            
+        return jsonify({
+            'success': True,
+            'execution_id': result.execution_id,
+            'squid_id': result.squid_id,
+            'status': result.status,
+            'duration_seconds': result.duration_seconds or elapsed_time,
+            'outputs': outputs
+        })
+
+    except ValueError as e:
+        logger.error(f"Validation error running simulation {simulation_name}: {e}")
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error executing simulation {simulation_name}: {e}", exc_info=True)
+        return jsonify({'error': f"Execution failed: {str(e)}"}), 500
 
 
 @app.route("/simulations/<int:simulation_id>/stats", methods=["GET"])
@@ -635,11 +784,13 @@ def get_pending_sync():
 
 @app.route("/sync/<int:request_id>/approve", methods=["POST"])
 def approve_sync(request_id):
-    # Read header first, then check — avoids auth bypass via default value
     session_id = request.headers.get("X-Session-ID")
-    if require_auth and not session_id:
-        return jsonify({"error": "Missing session ID"}), 401
-    session_id = session_id or "no-auth-session"
+    if require_auth:
+        if not session_id:
+            return jsonify({"error": "Missing session ID"}), 401
+    else:
+        # In no-auth mode, always use elevated local session regardless of header value.
+        session_id = "no-auth-session"
 
     result, status = catalog_db.approve_sync(request_id, session_id)
     return jsonify(result), status

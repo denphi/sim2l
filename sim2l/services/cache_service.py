@@ -89,6 +89,9 @@ class CacheServiceBackend:
     def invalidate(self, filters: dict, session_id: str):
         raise NotImplementedError
 
+    def delete(self, cache_key: str, session_id: str):
+        raise NotImplementedError
+
     def get_stats(self, simulation_id: Optional[int]):
         raise NotImplementedError
 
@@ -281,6 +284,21 @@ class SQLiteCacheBackend(CacheServiceBackend):
 
         return {"invalidated_count": invalidated_count}, 200
 
+    def delete(self, cache_key: str, session_id: str):
+        if not self._check_session(session_id):
+            return {"error": "Unauthorized"}, 401
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cache_entries WHERE cache_key = ?", (cache_key,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {"error": "Not found"}, 404
+
+        return {"deleted_count": deleted_count, "cache_key": cache_key}, 200
+
     def get_stats(self, simulation_id: Optional[int]):
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -462,6 +480,22 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         conn.commit()
         logger.info("Created demo session for no-auth mode")
 
+    def _check_write_session(self, session_id: str) -> bool:
+        """Check if the session has write/admin access."""
+        cursor = self._get_conn().cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM cache_sessions
+            WHERE session_id = %s
+              AND is_valid = true
+              AND expires_at > CURRENT_TIMESTAMP
+              AND access_level IN ('write', 'admin')
+            """,
+            (session_id,),
+        )
+        return cursor.fetchone() is not None
+
     def get(self, cache_key: str, session_id: str):
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -548,6 +582,21 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         conn.commit()
 
         return {"invalidated_count": invalidated_count}, 200
+
+    def delete(self, cache_key: str, session_id: str):
+        if not self._check_write_session(session_id):
+            return {"error": "Unauthorized"}, 401
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cache_entries WHERE cache_key = %s", (cache_key,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {"error": "Not found"}, 404
+
+        return {"deleted_count": deleted_count, "cache_key": cache_key}, 200
 
     def get_stats(self, simulation_id: Optional[int]):
         conn = self._get_conn()
@@ -733,6 +782,19 @@ def get_cache(cache_key):
     else:
         logger.debug(f"Cache miss for key: {cache_key}")
         return jsonify({"error": "Not found"}), status
+
+
+@app.route("/cache/<path:cache_key>", methods=["DELETE"])
+def delete_cache(cache_key):
+    # Read header first, then check — avoids auth bypass via default value
+    session_id = request.headers.get("X-Session-ID")
+    if require_auth and not session_id:
+        logger.warning(f"Missing session ID for cache delete: {cache_key}")
+        return jsonify({"error": "Missing session ID"}), 401
+    session_id = session_id or "demo-session"
+
+    result, status = cache_db.delete(cache_key, session_id)
+    return jsonify(result), status
 
 
 @app.route("/cache", methods=["POST"])

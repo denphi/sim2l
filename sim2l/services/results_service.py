@@ -10,7 +10,6 @@ Similar to the legacy registerSquidpgSimtool but modernized for sim2l architectu
 import os
 import logging
 import threading
-from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from flask import Flask, request, jsonify
 
@@ -65,6 +64,10 @@ class ResultsBackend:
 
     def get_result(self, execution_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific execution result."""
+        raise NotImplementedError
+
+    def delete_result(self, execution_id: str) -> Tuple[Dict[str, Any], int]:
+        """Delete a specific execution result."""
         raise NotImplementedError
 
     def get_parameter_stats(
@@ -411,6 +414,20 @@ class SQLiteResultsBackend(ResultsBackend):
             'metadata': json.loads(row['metadata']) if row['metadata'] else None
         }
 
+    def delete_result(self, execution_id: str) -> Tuple[Dict[str, Any], int]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM result_errors WHERE execution_id = ?", (execution_id,))
+        cursor.execute("DELETE FROM execution_results WHERE execution_id = ?", (execution_id,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {'error': 'Result not found'}, 404
+
+        return {'status': 'deleted', 'execution_id': execution_id}, 200
+
     def get_parameter_stats(
         self,
         simulation_name: str,
@@ -625,6 +642,20 @@ class PostgreSQLResultsBackend(ResultsBackend):
             'run_db_path': row['run_db_path'],
             'metadata': row['metadata'],
         }
+
+    def delete_result(self, execution_id: str) -> Tuple[Dict[str, Any], int]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("DELETE FROM result_errors WHERE execution_id = %s", (execution_id,))
+        cursor.execute("DELETE FROM execution_results WHERE execution_id = %s", (execution_id,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {'error': 'Result not found'}, 404
+
+        return {'status': 'deleted', 'execution_id': execution_id}, 200
 
     def get_parameter_stats(
         self,
@@ -984,7 +1015,7 @@ def create_results_service(
             'count': len(results)
         })
 
-    @app.route('/results/<execution_id>', methods=['GET'])
+    @app.route('/results/<path:execution_id>', methods=['GET'])
     def get_result(execution_id):
         """Get a specific result."""
         auth_result = check_session()
@@ -997,6 +1028,16 @@ def create_results_service(
             return jsonify({'error': 'Result not found'}), 404
 
         return jsonify(result)
+
+    @app.route('/results/<path:execution_id>', methods=['DELETE'])
+    def delete_result(execution_id):
+        """Delete a specific result."""
+        auth_result = check_session()
+        if isinstance(auth_result, tuple):
+            return auth_result
+
+        result, status = results_backend.delete_result(execution_id)
+        return jsonify(result), status
 
     @app.route('/stats/<simulation_name>/<param_name>', methods=['GET'])
     def get_parameter_stats(simulation_name, param_name):

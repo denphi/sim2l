@@ -25,6 +25,7 @@ echo -e "${BLUE}Starting Cache Service on port 8001...${NC}"
 python3 -m sim2l.services.cache_service \
     --backend sqlite \
     --db-path ~/.sim2l/cache.db \
+    --no-auth \
     --port 8001 \
     > ~/.sim2l/logs/cache.log 2>&1 &
 CACHE_PID=$!
@@ -38,6 +39,7 @@ echo -e "${BLUE}Starting Catalog Service on port 8002...${NC}"
 python3 -m sim2l.services.catalog_service \
     --backend sqlite \
     --db-path ~/.sim2l/catalog.db \
+    --no-auth \
     --port 8002 \
     > ~/.sim2l/logs/catalog.log 2>&1 &
 CATALOG_PID=$!
@@ -51,6 +53,7 @@ echo -e "${BLUE}Starting Results Service on port 8003...${NC}"
 python3 -m sim2l.services.results_service \
     --backend sqlite \
     --db-path ~/.sim2l/results.db \
+    --no-auth \
     --port 8003 \
     > ~/.sim2l/logs/results.log 2>&1 &
 RESULTS_PID=$!
@@ -95,3 +98,5 @@ echo "  Results: ~/.sim2l/logs/results.log"
 echo ""
 echo "To stop services, run: ./stop_services.sh"
 echo "To view logs: tail -f ~/.sim2l/logs/*.log"
+echo ""
+echo "Auth mode: disabled (--no-auth) for local UI development"

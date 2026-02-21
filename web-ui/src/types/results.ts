@@ -49,3 +49,19 @@ export interface SearchFilters {
   limit?: number;
   offset?: number;
 }
+
+export interface RunRequest {
+  simulation_name: string;
+  version?: string;
+  params: Record<string, any>;
+}
+
+export interface RunResponse {
+  success: boolean;
+  execution_id?: string;
+  squid_id?: string;
+  status?: string;
+  duration_seconds?: number;
+  outputs?: Record<string, any>;
+  error?: string;
+}

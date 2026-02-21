@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Box,
   Container,
@@ -10,7 +10,6 @@ import {
   TableContainer,
   TableHead,
   TableRow,
-  TablePagination,
   Chip,
   TextField,
   Grid,
@@ -31,13 +30,13 @@ import {
   KeyboardArrowUp as KeyboardArrowUpIcon,
   Search as SearchIcon,
   Clear as ClearIcon,
+  Delete as DeleteIcon,
 } from '@mui/icons-material';
 import { resultsService } from '../api/resultsService';
 import type { ExecutionResult } from '../types/results';
 
 export function Results() {
   const [results, setResults] = useState<ExecutionResult[]>([]);
-  const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [rowsPerPage, setRowsPerPage] = useState(25);
   const [loading, setLoading] = useState(true);
@@ -47,6 +46,7 @@ export function Results() {
   const [inputFilter, setInputFilter] = useState('');
   const [outputFilter, setOutputFilter] = useState('');
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [deletingExecutionId, setDeletingExecutionId] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
@@ -131,26 +131,12 @@ export function Results() {
       });
 
       setResults(response.results || []);
-      // The search endpoint returns count (results in this response), not total
-      // We'll disable pagination and just show all results with limit
-      const resultCount = response.results?.length || 0;
-      setTotal(resultCount);
     } catch (error) {
       console.error('Failed to load results:', error);
       setResults([]);
-      setTotal(0);
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleChangePage = (_event: unknown, newPage: number) => {
-    setPage(newPage);
-  };
-
-  const handleChangeRowsPerPage = (event: React.ChangeEvent<HTMLInputElement>) => {
-    setRowsPerPage(parseInt(event.target.value, 10));
-    setPage(0);
   };
 
   const handleSearch = () => {
@@ -166,6 +152,26 @@ export function Results() {
     setOutputFilter('');
     setPage(0);
     setTimeout(loadData, 0);
+  };
+
+  const handleDeleteResult = async (result: ExecutionResult) => {
+    const confirmed = window.confirm(
+      `Delete result "${result.execution_id}" for ${result.simulation_name}/${result.simulation_version}?`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingExecutionId(result.execution_id);
+    try {
+      await resultsService.deleteResult(result.execution_id);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to delete result:', error);
+      window.alert('Failed to delete result. See browser console for details.');
+    } finally {
+      setDeletingExecutionId(null);
+    }
   };
 
   const toggleRowExpanded = (executionId: string) => {
@@ -205,6 +211,12 @@ export function Results() {
       default:
         return 'default';
     }
+  };
+
+  const formatSquidId = (result: ExecutionResult) => {
+    if (!result.squid_id) return 'N/A';
+    if (result.squid_id.includes('/')) return result.squid_id;
+    return `${result.simulation_name}/${result.simulation_version}/${result.squid_id}`;
   };
 
   return (
@@ -338,169 +350,188 @@ export function Results() {
                   <TableCell>SQUID ID</TableCell>
                   <TableCell>Simulation</TableCell>
                   <TableCell>Status</TableCell>
+                  <TableCell align="center">Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {results.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={4} align="center">
+                    <TableCell colSpan={5} align="center">
                       <Typography color="textSecondary" py={4}>
                         No execution results found
                       </Typography>
                     </TableCell>
                   </TableRow>
                 ) : (
-                  results.map((result) => (
-                    <>
-                      <TableRow key={result.execution_id} hover>
-                        <TableCell>
-                          <IconButton
-                            size="small"
-                            onClick={() => toggleRowExpanded(result.execution_id)}
-                          >
-                            {expandedRows.has(result.execution_id) ? (
-                              <KeyboardArrowUpIcon />
-                            ) : (
-                              <KeyboardArrowDownIcon />
-                            )}
-                          </IconButton>
-                        </TableCell>
-                        <TableCell>
-                          <Tooltip title="Full SQUID ID - unique identifier for this parameter set">
-                            <Typography
-                              variant="body2"
-                              fontFamily="monospace"
-                              fontWeight="bold"
-                              sx={{
-                                cursor: 'pointer',
-                                '&:hover': { color: 'primary.main' }
-                              }}
+                  results.map((result) => {
+                    const fullSquidId = formatSquidId(result);
+                    return (
+                      <React.Fragment key={result.execution_id}>
+                        <TableRow hover>
+                          <TableCell>
+                            <IconButton
+                              size="small"
+                              onClick={() => toggleRowExpanded(result.execution_id)}
                             >
-                              {result.squid_id || 'N/A'}
+                              {expandedRows.has(result.execution_id) ? (
+                                <KeyboardArrowUpIcon />
+                              ) : (
+                                <KeyboardArrowDownIcon />
+                              )}
+                            </IconButton>
+                          </TableCell>
+                          <TableCell>
+                            <Tooltip title="Full SQUID ID - unique identifier for this parameter set">
+                              <Typography
+                                variant="body2"
+                                fontFamily="monospace"
+                                fontWeight="bold"
+                                sx={{
+                                  cursor: 'pointer',
+                                  '&:hover': { color: 'primary.main' }
+                                }}
+                                onClick={() => fullSquidId !== 'N/A' && navigator.clipboard.writeText(fullSquidId)}
+                              >
+                                {fullSquidId}
+                              </Typography>
+                            </Tooltip>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" fontWeight="medium">
+                              {result.simulation_name}
                             </Typography>
-                          </Tooltip>
-                        </TableCell>
-                        <TableCell>
-                          <Typography variant="body2" fontWeight="medium">
-                            {result.simulation_name}
-                          </Typography>
-                          <Typography variant="caption" color="textSecondary">
-                            v{result.simulation_version}
-                          </Typography>
-                        </TableCell>
-                        <TableCell>
-                          <Chip
-                            icon={getStatusIcon(result.status)}
-                            label={result.status}
-                            color={getStatusColor(result.status)}
-                            size="small"
-                          />
-                        </TableCell>
-                      </TableRow>
-                      <TableRow>
-                        <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={4}>
-                          <Collapse in={expandedRows.has(result.execution_id)} timeout="auto" unmountOnExit>
-                            <Box sx={{ margin: 2 }}>
-                              {/* SQUID ID Header */}
-                              <Paper sx={{ p: 2, mb: 2, bgcolor: 'primary.50', border: '2px solid', borderColor: 'primary.main' }}>
-                                <Typography variant="subtitle2" color="primary.dark" gutterBottom>
-                                  SQUID ID (Unique Parameter Identifier)
-                                </Typography>
-                                <Box display="flex" alignItems="center" gap={2}>
-                                  <Typography
-                                    variant="h6"
-                                    fontFamily="monospace"
-                                    fontWeight="bold"
-                                    sx={{ wordBreak: 'break-all' }}
-                                  >
-                                    {result.squid_id || 'N/A'}
+                            <Typography variant="caption" color="textSecondary">
+                              v{result.simulation_version}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              icon={getStatusIcon(result.status)}
+                              label={result.status}
+                              color={getStatusColor(result.status)}
+                              size="small"
+                            />
+                          </TableCell>
+                          <TableCell align="center">
+                            <Tooltip title="Delete result">
+                              <span>
+                                <IconButton
+                                  color="error"
+                                  size="small"
+                                  onClick={() => handleDeleteResult(result)}
+                                  disabled={deletingExecutionId === result.execution_id}
+                                >
+                                  <DeleteIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                          </TableCell>
+                        </TableRow>
+                        <TableRow>
+                          <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={5}>
+                            <Collapse in={expandedRows.has(result.execution_id)} timeout="auto" unmountOnExit>
+                              <Box sx={{ margin: 2 }}>
+                                {/* SQUID ID Header */}
+                                <Paper sx={{ p: 2, mb: 2, bgcolor: 'primary.50', border: '2px solid', borderColor: 'primary.main' }}>
+                                  <Typography variant="subtitle2" color="primary.dark" gutterBottom>
+                                    SQUID ID (Unique Parameter Identifier)
                                   </Typography>
-                                  <Chip
-                                    label="Copy"
-                                    size="small"
-                                    onClick={() => {
-                                      navigator.clipboard.writeText(result.squid_id || '');
-                                    }}
-                                    sx={{ cursor: 'pointer' }}
-                                  />
-                                </Box>
-                                <Typography variant="caption" color="textSecondary" sx={{ mt: 1, display: 'block' }}>
-                                  This ID uniquely identifies this specific combination of input parameters.
-                                  Use it to find all executions with identical inputs.
-                                </Typography>
-                              </Paper>
+                                  <Box display="flex" alignItems="center" gap={2}>
+                                    <Typography
+                                      variant="h6"
+                                      fontFamily="monospace"
+                                      fontWeight="bold"
+                                      sx={{ wordBreak: 'break-all' }}
+                                    >
+                                      {result.squid_id || 'N/A'}
+                                    </Typography>
+                                    <Chip
+                                      label="Copy"
+                                      size="small"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(result.squid_id || '');
+                                      }}
+                                      sx={{ cursor: 'pointer' }}
+                                    />
+                                  </Box>
+                                  <Typography variant="caption" color="textSecondary" sx={{ mt: 1, display: 'block' }}>
+                                    This ID uniquely identifies this specific combination of input parameters.
+                                    Use it to find all executions with identical inputs.
+                                  </Typography>
+                                </Paper>
 
-                              <Grid container spacing={2}>
-                                <Grid item xs={12} md={6}>
-                                  <Typography variant="h6" gutterBottom component="div">
-                                    Input Parameters
-                                  </Typography>
-                                  <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-                                    {result.input_params && Object.keys(result.input_params).length > 0 ? (
-                                      <Box component="pre" sx={{ margin: 0, fontSize: '0.875rem' }}>
-                                        {JSON.stringify(result.input_params, null, 2)}
-                                      </Box>
-                                    ) : (
-                                      <Typography color="textSecondary">No input parameters</Typography>
-                                    )}
-                                  </Paper>
-                                </Grid>
-                                <Grid item xs={12} md={6}>
-                                  <Typography variant="h6" gutterBottom component="div">
-                                    Output Parameters
-                                  </Typography>
-                                  <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-                                    {result.output_params && Object.keys(result.output_params).length > 0 ? (
-                                      <Box component="pre" sx={{ margin: 0, fontSize: '0.875rem', maxHeight: 300, overflow: 'auto' }}>
-                                        {JSON.stringify(result.output_params, null, 2)}
-                                      </Box>
-                                    ) : (
-                                      <Typography color="textSecondary">No output parameters</Typography>
-                                    )}
-                                  </Paper>
-                                </Grid>
+                                <Grid container spacing={2}>
+                                  <Grid item xs={12} md={6}>
+                                    <Typography variant="h6" gutterBottom component="div">
+                                      Input Parameters
+                                    </Typography>
+                                    <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
+                                      {result.input_params && Object.keys(result.input_params).length > 0 ? (
+                                        <Box component="pre" sx={{ margin: 0, fontSize: '0.875rem' }}>
+                                          {JSON.stringify(result.input_params, null, 2)}
+                                        </Box>
+                                      ) : (
+                                        <Typography color="textSecondary">No input parameters</Typography>
+                                      )}
+                                    </Paper>
+                                  </Grid>
+                                  <Grid item xs={12} md={6}>
+                                    <Typography variant="h6" gutterBottom component="div">
+                                      Output Parameters
+                                    </Typography>
+                                    <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
+                                      {result.output_params && Object.keys(result.output_params).length > 0 ? (
+                                        <Box component="pre" sx={{ margin: 0, fontSize: '0.875rem', maxHeight: 300, overflow: 'auto' }}>
+                                          {JSON.stringify(result.output_params, null, 2)}
+                                        </Box>
+                                      ) : (
+                                        <Typography color="textSecondary">No output parameters</Typography>
+                                      )}
+                                    </Paper>
+                                  </Grid>
 
-                                {/* Execution Metadata */}
-                                <Grid item xs={12}>
-                                  <Typography variant="h6" gutterBottom component="div">
-                                    Execution Metadata
-                                  </Typography>
-                                  <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
-                                    <Grid container spacing={2}>
-                                      <Grid item xs={12} sm={6} md={3}>
-                                        <Typography variant="caption" color="textSecondary">Execution ID</Typography>
-                                        <Typography variant="body2" fontFamily="monospace">
-                                          {result.execution_id}
-                                        </Typography>
+                                  {/* Execution Metadata */}
+                                  <Grid item xs={12}>
+                                    <Typography variant="h6" gutterBottom component="div">
+                                      Execution Metadata
+                                    </Typography>
+                                    <Paper variant="outlined" sx={{ p: 2, bgcolor: 'grey.50' }}>
+                                      <Grid container spacing={2}>
+                                        <Grid item xs={12} sm={6} md={3}>
+                                          <Typography variant="caption" color="textSecondary">Execution ID</Typography>
+                                          <Typography variant="body2" fontFamily="monospace">
+                                            {result.execution_id}
+                                          </Typography>
+                                        </Grid>
+                                        <Grid item xs={12} sm={6} md={3}>
+                                          <Typography variant="caption" color="textSecondary">Started</Typography>
+                                          <Typography variant="body2">
+                                            {result.started_at ? formatDate(result.started_at) : 'N/A'}
+                                          </Typography>
+                                        </Grid>
+                                        <Grid item xs={12} sm={6} md={3}>
+                                          <Typography variant="caption" color="textSecondary">Duration</Typography>
+                                          <Typography variant="body2">
+                                            {result.execution_time_ms ? `${(result.execution_time_ms / 1000).toFixed(3)}s` : 'N/A'}
+                                          </Typography>
+                                        </Grid>
+                                        <Grid item xs={12} sm={6} md={3}>
+                                          <Typography variant="caption" color="textSecondary">Cache Hit</Typography>
+                                          <Typography variant="body2">
+                                            {result.cache_hit ? '✓ Yes' : '✗ No'}
+                                          </Typography>
+                                        </Grid>
                                       </Grid>
-                                      <Grid item xs={12} sm={6} md={3}>
-                                        <Typography variant="caption" color="textSecondary">Started</Typography>
-                                        <Typography variant="body2">
-                                          {result.started_at ? formatDate(result.started_at) : 'N/A'}
-                                        </Typography>
-                                      </Grid>
-                                      <Grid item xs={12} sm={6} md={3}>
-                                        <Typography variant="caption" color="textSecondary">Duration</Typography>
-                                        <Typography variant="body2">
-                                          {result.execution_time_ms ? `${(result.execution_time_ms / 1000).toFixed(3)}s` : 'N/A'}
-                                        </Typography>
-                                      </Grid>
-                                      <Grid item xs={12} sm={6} md={3}>
-                                        <Typography variant="caption" color="textSecondary">Cache Hit</Typography>
-                                        <Typography variant="body2">
-                                          {result.cache_hit ? '✓ Yes' : '✗ No'}
-                                        </Typography>
-                                      </Grid>
-                                    </Grid>
-                                  </Paper>
+                                    </Paper>
+                                  </Grid>
                                 </Grid>
-                              </Grid>
-                            </Box>
-                          </Collapse>
-                        </TableCell>
-                      </TableRow>
-                    </>
-                  ))
+                              </Box>
+                            </Collapse>
+                          </TableCell>
+                        </TableRow>
+                      </React.Fragment>
+                    );
+                  })
                 )}
               </TableBody>
             </Table>
