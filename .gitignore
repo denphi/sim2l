@@ -65,3 +65,33 @@ target/
 .ipynb_checkpoints
 
 .claude/
+
+# macOS / editor artifacts
+.DS_Store
+.vscode/
+.idea/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime artifacts
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+datasim2l
+
+# Generated reports
+sim2l_workflow_report.html
+sim2l_postgresql_workflow_report.html
+examples/*workflow_report*.html
+
+# Web UI local artifacts
+web-ui/node_modules/
+web-ui/dist/
+web-ui/.vite/
+web-ui/.env
+web-ui/.env.local
+web-ui/.env.*.local
