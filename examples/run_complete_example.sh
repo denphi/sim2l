@@ -1,4 +1,8 @@
 #!/bin/bash
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 # Run the complete sim2l workflow example
 #
 # This script:

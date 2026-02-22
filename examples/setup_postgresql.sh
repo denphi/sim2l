@@ -1,4 +1,8 @@
 #!/bin/bash
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 # PostgreSQL Setup Script for sim2l
 # This script creates the necessary PostgreSQL databases for sim2l services
 
@@ -14,15 +18,17 @@ POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
 CACHE_DB="sim2l_cache"
 CATALOG_DB="sim2l_catalog"
 RESULTS_DB="sim2l_results"
+TEST_DB="sim2l_test"
 
 echo "========================================================================"
 echo "sim2l PostgreSQL Setup"
 echo "========================================================================"
 echo ""
-echo "This script will create three PostgreSQL databases:"
+echo "This script will create four PostgreSQL databases:"
 echo "  1. $CACHE_DB    - Cache service database"
 echo "  2. $CATALOG_DB  - Catalog service database"
 echo "  3. $RESULTS_DB  - Results service database"
+echo "  4. $TEST_DB     - PostgreSQL integration test database"
 echo ""
 echo "PostgreSQL connection:"
 echo "  Host: $POSTGRES_HOST"
@@ -58,7 +64,7 @@ echo ""
 # Create databases
 echo "Creating databases..."
 
-for db in "$CACHE_DB" "$CATALOG_DB" "$RESULTS_DB"; do
+for db in "$CACHE_DB" "$CATALOG_DB" "$RESULTS_DB" "$TEST_DB"; do
     echo "  Creating $db..."
     if psql_exec -lqt postgres | cut -d \| -f 1 | grep -qw "$db"; then
         echo "    ⚠ Database $db already exists, dropping and recreating..."
@@ -92,6 +98,11 @@ echo "  Initializing $RESULTS_DB..."
 psql_exec -d "$RESULTS_DB" -f "$SCHEMA_DIR/results_db_schema.sql" > /dev/null
 echo "    ✓ Results schema initialized"
 
+# The test database is intentionally kept schema-light.
+# Tests create/drop the required objects during execution.
+echo "  Preparing $TEST_DB..."
+echo "    ✓ Test database ready (schema is managed by tests)"
+
 echo ""
 echo "========================================================================"
 echo "Setup Complete!"
@@ -107,6 +118,9 @@ echo "  postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$CATALOG_DB"
 echo ""
 echo "Results Service:"
 echo "  postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$RESULTS_DB"
+echo ""
+echo "Integration Test DB:"
+echo "  postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$TEST_DB"
 echo ""
 echo "To start services with PostgreSQL:"
 echo "  python3 -m sim2l.services.cache_service --backend postgresql --db-url 'postgresql://$POSTGRES_USER@$POSTGRES_HOST:$POSTGRES_PORT/$CACHE_DB' --no-auth"

@@ -36,6 +36,12 @@ PostgreSQL-dependent tests need a running local PostgreSQL instance. Start it wi
 ./start_postgres_services.sh
 ```
 
+Schema details and initialization ownership are documented in:
+
+```bash
+sim2l/database/SCHEMAS.md
+```
+
 If a local PostgreSQL is already running on `localhost:5432`, the script will reuse it
 and still create the required test databases.
 

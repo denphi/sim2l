@@ -1,3 +1,7 @@
+-- @package    sim2l library
+-- @copyright  Copyright (c) 2005-2026 Purdue University.
+-- @license    http://opensource.org/licenses/MIT MIT
+
 -- Master Catalog Database Schema (PostgreSQL)
 -- Central registry for all sim2l tools, versions, and metadata
 

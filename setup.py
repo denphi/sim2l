@@ -1,3 +1,7 @@
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 """Setup configuration for sim2l package"""
 
 from setuptools import setup, find_packages

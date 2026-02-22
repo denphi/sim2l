@@ -1,3 +1,7 @@
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 """
 Legacy cache adapter for backward compatibility with papers/simtool cache.
 
@@ -246,7 +250,7 @@ class PsqlModelAdapter:
             for key, value in predicate.items():
                 if key == "tab":
                     conditions.append(f'''"VALUES"->>'{{key}}' LIKE %s''')
-                    params.append(f"%{json.dumps(value).strip('\"')}%")
+                    params.append("%" + json.dumps(value).strip('"') + "%")
                 else:
                     conditions.append(f'''"VALUES"->>'{{key}}' = %s''')
                     params.append(json.dumps(value).strip('"'))

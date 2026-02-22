@@ -1,3 +1,7 @@
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 """Example: Using a Notebook-Based Simulation
 
 This example shows how to use a simulation that was defined in a Jupyter notebook.

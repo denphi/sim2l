@@ -2,6 +2,9 @@
 
 This directory contains Docker configurations for running sim2l database services.
 
+Schema reference:
+- `sim2l/database/SCHEMAS.md`
+
 ## Quick Start
 
 ### Development (SQLite backends)

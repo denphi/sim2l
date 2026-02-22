@@ -1,3 +1,7 @@
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 """Example: File Processing Simulation with File Input/Output
 
 This example demonstrates:

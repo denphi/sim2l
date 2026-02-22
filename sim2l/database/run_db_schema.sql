@@ -1,3 +1,7 @@
+-- @package    sim2l library
+-- @copyright  Copyright (c) 2005-2026 Purdue University.
+-- @license    http://opensource.org/licenses/MIT MIT
+
 -- Per-Run SQLite Database Schema
 -- One database per execution run, stores complete run information
 

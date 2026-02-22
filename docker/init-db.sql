@@ -1,3 +1,7 @@
+-- @package    sim2l library
+-- @copyright  Copyright (c) 2005-2026 Purdue University.
+-- @license    http://opensource.org/licenses/MIT MIT
+
 -- Initialize PostgreSQL databases for sim2l services
 
 -- Create separate databases for services and integration tests

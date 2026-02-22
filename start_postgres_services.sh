@@ -1,4 +1,8 @@
 #!/bin/bash
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 # Start PostgreSQL for sim2l integration tests.
 # Prefer an existing localhost PostgreSQL (dev or docker). Fall back to docker compose.
 

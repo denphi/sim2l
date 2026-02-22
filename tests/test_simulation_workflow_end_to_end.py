@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# @package    sim2l library
+# @copyright  Copyright (c) 2005-2026 Purdue University.
+# @license    http://opensource.org/licenses/MIT MIT
+
 """
 Unit tests for the complete workflow example
 
