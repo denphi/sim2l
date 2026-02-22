@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS simulations (
     output_schema JSONB NOT NULL,
     workflow_type TEXT NOT NULL, -- 'notebook', 'function', 'dag'
     workflow_hash TEXT NOT NULL, -- SHA256 for version verification
+    workflow_bundle JSONB, -- Serialized workflow files (notebook/function/docker context)
     dependencies JSONB, -- Array of package dependencies
     python_version TEXT, -- Minimum Python version required
     status TEXT NOT NULL DEFAULT 'active', -- 'active', 'deprecated', 'archived'

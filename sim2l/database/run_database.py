@@ -570,13 +570,32 @@ class RunDatabase:
         return logs
 
     def get_errors(self) -> List[Dict[str, Any]]:
-        """Get all error logs."""
+        """Get all error and critical logs with full log fields."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM error_summary")
+        cursor.execute(
+            """
+            SELECT *
+            FROM logs
+            WHERE level IN ('ERROR', 'CRITICAL')
+            ORDER BY timestamp DESC
+            """
+        )
 
         errors = []
         for row in cursor.fetchall():
-            errors.append(dict(row))
+            errors.append(
+                {
+                    "id": row["id"],
+                    "timestamp": row["timestamp"],
+                    "level": row["level"],
+                    "logger": row["logger"],
+                    "message": row["message"],
+                    "context": json.loads(row["context"]) if row["context"] else None,
+                    "exception_type": row["exception_type"],
+                    "exception_message": row["exception_message"],
+                    "stack_trace": row["stack_trace"],
+                }
+            )
 
         return errors
 

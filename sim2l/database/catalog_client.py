@@ -9,10 +9,43 @@ import requests
 import logging
 import hashlib
 import json
+import base64
 from typing import Dict, Optional, Any, List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _default_workflow_entrypoint(workflow_type: str) -> str:
+    workflow_type = (workflow_type or "").lower()
+    if workflow_type == "notebook":
+        return "workflow.ipynb"
+    if workflow_type in ("function", "python"):
+        return "workflow.py"
+    if workflow_type == "docker":
+        return "Dockerfile"
+    return "workflow.bin"
+
+
+def _workflow_bundle_from_simulation(sim_def) -> Dict[str, Any]:
+    """Build a portable workflow bundle payload from a SimulationDefinition."""
+    workflow_bytes = sim_def.get_workflow_bytes()
+    entrypoint = _default_workflow_entrypoint(getattr(sim_def, "workflow_type", "notebook"))
+
+    return {
+        "format_version": 1,
+        "workflow_type": sim_def.workflow_type,
+        "entrypoint": entrypoint,
+        "files": [
+            {
+                "path": entrypoint,
+                "encoding": "base64",
+                "content_base64": base64.b64encode(workflow_bytes).decode("ascii"),
+                "size_bytes": len(workflow_bytes),
+                "sha256": hashlib.sha256(workflow_bytes).hexdigest(),
+            }
+        ],
+    }
 
 
 class CatalogClient:
@@ -203,6 +236,9 @@ class CatalogClient:
         output_schema: Optional[Dict[str, Any]] = None,
         workflow_type: str = "notebook",
         workflow_hash: Optional[str] = None,
+        workflow_bundle: Optional[Dict[str, Any]] = None,
+        workflow_files: Optional[List[Dict[str, Any]]] = None,
+        workflow_entrypoint: Optional[str] = None,
         dependencies: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         auto_approve: bool = False,
@@ -223,6 +259,9 @@ class CatalogClient:
             output_schema: Output schema (JSON)
             workflow_type: 'notebook', 'function', or 'dag'
             workflow_hash: SHA256 hash of workflow
+            workflow_bundle: Portable workflow bundle with embedded files
+            workflow_files: Convenience alternative to workflow_bundle.files
+            workflow_entrypoint: Entrypoint path within workflow bundle/files
             dependencies: List of package dependencies
             metadata: Additional metadata
             auto_approve: Auto-approve if user has privilege (admin only)
@@ -246,6 +285,12 @@ class CatalogClient:
                 "metadata": metadata,
                 "auto_approve": auto_approve,
             }
+            if workflow_bundle is not None:
+                payload["workflow_bundle"] = workflow_bundle
+            if workflow_files is not None:
+                payload["workflow_files"] = workflow_files
+            if workflow_entrypoint is not None:
+                payload["workflow_entrypoint"] = workflow_entrypoint
 
             response = self._session.post(
                 f"{self.service_url}/simulations",
@@ -471,8 +516,8 @@ class CatalogClient:
             # Connect to local repository
             backend = SQLiteBackend(repository_path)
 
-            # Get all simulations
-            local_sims = backend.list_all()
+            # Get all active simulations
+            local_sims = backend.list(status="active")
             results["scanned"] = len(local_sims)
 
             for sim in local_sims:
@@ -487,6 +532,28 @@ class CatalogClient:
                     logger.debug(f"Simulation {name}/{version} already in catalog")
                     continue
 
+                input_schema = sim.get("input_schema")
+                output_schema = sim.get("output_schema")
+                workflow_type = sim.get("workflow_type", "notebook")
+                workflow_hash = sim.get("workflow_hash")
+                dependencies = sim.get("dependencies", [])
+                workflow_bundle = None
+                try:
+                    sim_def = backend.load(name, version)
+                    input_schema = sim_def.inputs.to_dict()
+                    output_schema = sim_def.outputs.to_dict()
+                    workflow_type = sim_def.workflow_type
+                    workflow_hash = sim_def.workflow_hash
+                    dependencies = sim_def.dependencies
+                    workflow_bundle = _workflow_bundle_from_simulation(sim_def)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not build workflow bundle for %s/%s: %s",
+                        name,
+                        version,
+                        exc,
+                    )
+
                 # Submit sync request
                 success = self.register_simulation(
                     name=name,
@@ -494,11 +561,12 @@ class CatalogClient:
                     description=sim.get("description"),
                     author=sim.get("author"),
                     tags=sim.get("tags", []),
-                    input_schema=sim.get("input_schema"),
-                    output_schema=sim.get("output_schema"),
-                    workflow_type=sim.get("workflow_type", "notebook"),
-                    workflow_hash=sim.get("workflow_hash"),
-                    dependencies=sim.get("dependencies", []),
+                    input_schema=input_schema,
+                    output_schema=output_schema,
+                    workflow_type=workflow_type,
+                    workflow_hash=workflow_hash,
+                    workflow_bundle=workflow_bundle,
+                    dependencies=dependencies,
                 )
 
                 if success:
@@ -631,8 +699,8 @@ class LocalCatalogClient:
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """Search local repository."""
-        # Use existing repository list method
-        simulations = self.repository.list_all(tags=tags, status=status)
+        # SQLiteBackend exposes `list`, not `list_all`.
+        simulations = self.repository.list(tags=tags, status=status)
 
         # Filter by query
         if query:

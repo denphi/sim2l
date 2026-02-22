@@ -10,18 +10,21 @@ Provides four database systems:
 """
 
 from .run_database import RunDatabase
-from .cache_client import CacheClient
-from .catalog_client import CatalogClient
+from .cache_client import CacheClient, LocalCacheClient
+from .catalog_client import CatalogClient, LocalCatalogClient
 from .results_client import ResultsClient
-from .session_manager import SessionManager, get_session_manager
+from .session_manager import SessionManager, get_session_manager, reset_session_manager
 from .file_manager import FileManager
 
 __all__ = [
     "RunDatabase",
     "CacheClient",
+    "LocalCacheClient",
     "CatalogClient",
+    "LocalCatalogClient",
     "ResultsClient",
     "SessionManager",
     "get_session_manager",
+    "reset_session_manager",
     "FileManager",
 ]

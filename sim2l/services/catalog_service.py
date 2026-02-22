@@ -11,6 +11,9 @@ import argparse
 import logging
 import threading
 import json
+import base64
+import binascii
+import hashlib
 from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
@@ -80,6 +83,202 @@ def _adapt_catalog_schema_for_sqlite(schema_sql: str) -> str:
     # Restore IF NOT EXISTS for table creation
     schema_sql = schema_sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
     return schema_sql
+
+
+def _default_workflow_entrypoint(workflow_type: Optional[str]) -> str:
+    workflow_type = (workflow_type or "").lower()
+    if workflow_type == "notebook":
+        return "workflow.ipynb"
+    if workflow_type in ("function", "python"):
+        return "workflow.py"
+    if workflow_type == "docker":
+        return "Dockerfile"
+    return "workflow.bin"
+
+
+def _normalize_workflow_file(file_data: dict, index: int) -> dict:
+    if not isinstance(file_data, dict):
+        raise ValueError(f"workflow_files[{index}] must be an object")
+
+    path = file_data.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"workflow_files[{index}].path must be a non-empty string")
+
+    content_base64 = file_data.get("content_base64")
+    if content_base64 is None:
+        content = file_data.get("content")
+        if content is None:
+            raise ValueError(
+                f"workflow_files[{index}] must contain either 'content_base64' or 'content'"
+            )
+        if not isinstance(content, str):
+            raise ValueError(f"workflow_files[{index}].content must be a string")
+        raw_content = content.encode("utf-8")
+        content_base64 = base64.b64encode(raw_content).decode("ascii")
+    elif not isinstance(content_base64, str):
+        raise ValueError(f"workflow_files[{index}].content_base64 must be a string")
+    else:
+        try:
+            raw_content = base64.b64decode(content_base64, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError(
+                f"workflow_files[{index}].content_base64 is not valid base64"
+            )
+
+    normalized = {
+        "path": path,
+        "encoding": "base64",
+        "content_base64": content_base64,
+        "size_bytes": len(raw_content),
+        "sha256": hashlib.sha256(raw_content).hexdigest(),
+    }
+
+    for optional_key in ("content_type", "mode", "description"):
+        value = file_data.get(optional_key)
+        if value is not None:
+            normalized[optional_key] = value
+
+    return normalized
+
+
+def _normalize_workflow_bundle(payload: dict) -> Optional[dict]:
+    workflow_type = payload.get("workflow_type", "notebook")
+    workflow_entrypoint = payload.get("workflow_entrypoint")
+
+    bundle = payload.get("workflow_bundle")
+    if bundle is not None:
+        if isinstance(bundle, str):
+            try:
+                bundle = json.loads(bundle)
+            except Exception:
+                raise ValueError("workflow_bundle must be valid JSON")
+        if not isinstance(bundle, dict):
+            raise ValueError("workflow_bundle must be an object")
+
+        raw_files = bundle.get("files", [])
+        if not isinstance(raw_files, list):
+            raise ValueError("workflow_bundle.files must be a list")
+
+        normalized_files = []
+        seen_paths = set()
+        for i, file_data in enumerate(raw_files):
+            normalized = _normalize_workflow_file(file_data, i)
+            if normalized["path"] in seen_paths:
+                raise ValueError(f"workflow_bundle.files has duplicate path '{normalized['path']}'")
+            seen_paths.add(normalized["path"])
+            normalized_files.append(normalized)
+
+        normalized_bundle = dict(bundle)
+        normalized_bundle["format_version"] = bundle.get("format_version", 1)
+        normalized_bundle["workflow_type"] = bundle.get("workflow_type", workflow_type)
+        normalized_bundle["entrypoint"] = (
+            bundle.get("entrypoint")
+            or workflow_entrypoint
+            or _default_workflow_entrypoint(normalized_bundle["workflow_type"])
+        )
+        normalized_bundle["files"] = normalized_files
+        return normalized_bundle
+
+    workflow_files = payload.get("workflow_files")
+    if workflow_files is None:
+        workflow_files = []
+        workflow_data_base64 = payload.get("workflow_data_base64")
+        workflow_data = payload.get("workflow_data")
+        dockerfile = payload.get("dockerfile")
+        docker_context_files = payload.get("docker_context_files")
+
+        if workflow_data_base64 is not None:
+            workflow_files.append(
+                {
+                    "path": workflow_entrypoint or _default_workflow_entrypoint(workflow_type),
+                    "content_base64": workflow_data_base64,
+                }
+            )
+        elif workflow_data is not None:
+            workflow_files.append(
+                {
+                    "path": workflow_entrypoint or _default_workflow_entrypoint(workflow_type),
+                    "content": workflow_data,
+                }
+            )
+
+        if dockerfile is not None:
+            workflow_files.append(
+                {
+                    "path": "Dockerfile",
+                    "content": dockerfile,
+                    "content_type": "text/plain",
+                }
+            )
+
+        if docker_context_files is not None:
+            if not isinstance(docker_context_files, list):
+                raise ValueError("docker_context_files must be a list")
+            workflow_files.extend(docker_context_files)
+
+        if not workflow_files:
+            return None
+
+    if not isinstance(workflow_files, list):
+        raise ValueError("workflow_files must be a list")
+
+    normalized_files = []
+    seen_paths = set()
+    for i, file_data in enumerate(workflow_files):
+        normalized = _normalize_workflow_file(file_data, i)
+        if normalized["path"] in seen_paths:
+            raise ValueError(f"workflow_files has duplicate path '{normalized['path']}'")
+        seen_paths.add(normalized["path"])
+        normalized_files.append(normalized)
+
+    return {
+        "format_version": 1,
+        "workflow_type": workflow_type,
+        "entrypoint": workflow_entrypoint or _default_workflow_entrypoint(workflow_type),
+        "files": normalized_files,
+    }
+
+
+def _normalize_schema(schema_value, field_name: str) -> Optional[dict]:
+    if schema_value is None:
+        return None
+    if isinstance(schema_value, str):
+        try:
+            schema_value = json.loads(schema_value)
+        except Exception:
+            raise ValueError(f"{field_name} must be valid JSON")
+    if not isinstance(schema_value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    return schema_value
+
+
+def _resolve_input_output_schemas(payload: dict, workflow_bundle: Optional[dict]) -> tuple[dict, dict]:
+    input_schema = payload.get("input_schema")
+    output_schema = payload.get("output_schema")
+
+    if workflow_bundle:
+        if input_schema is None:
+            input_schema = workflow_bundle.get("input_schema")
+        if output_schema is None:
+            output_schema = workflow_bundle.get("output_schema")
+
+        schemas = workflow_bundle.get("schemas")
+        if isinstance(schemas, dict):
+            if input_schema is None:
+                input_schema = schemas.get("input")
+            if output_schema is None:
+                output_schema = schemas.get("output")
+
+    input_schema = _normalize_schema(input_schema, "input_schema")
+    output_schema = _normalize_schema(output_schema, "output_schema")
+
+    if input_schema is None or output_schema is None:
+        raise ValueError(
+            "input_schema and output_schema are required "
+            "(provide directly or include them in workflow_bundle)"
+        )
+
+    return input_schema, output_schema
 
 
 class CatalogServiceBackend:
@@ -160,10 +359,21 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             conn = self._get_conn()
             try:
                 conn.executescript(schema_sql)
+                self._ensure_schema_extensions(conn)
                 conn.commit()
                 logger.info("SQLite catalog schema created")
             except Exception as e:
                 logger.error(f"Failed to create schema: {e}")
+
+    def _ensure_schema_extensions(self, conn):
+        """Apply non-breaking schema upgrades for existing SQLite databases."""
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(simulations)")
+        columns = {row["name"] for row in cursor.fetchall()}
+
+        if "workflow_bundle" not in columns:
+            cursor.execute("ALTER TABLE simulations ADD COLUMN workflow_bundle TEXT")
+            logger.info("Added 'workflow_bundle' column to SQLite catalog schema")
 
     def _check_session(self, session_id: str) -> bool:
         """Check if session is valid."""
@@ -280,7 +490,14 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             return None, 404
 
         sim = dict(row)
-        for field in ["tags", "input_schema", "output_schema", "dependencies", "metadata"]:
+        for field in [
+            "tags",
+            "input_schema",
+            "output_schema",
+            "dependencies",
+            "metadata",
+            "workflow_bundle",
+        ]:
             if sim.get(field):
                 sim[field] = json.loads(sim[field])
 
@@ -291,6 +508,14 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
 
         if not self._check_privilege(session_id, "catalog_update"):
             return {"error": "Insufficient privileges"}, 403
+
+        try:
+            workflow_bundle = _normalize_workflow_bundle(data)
+            input_schema, output_schema = _resolve_input_output_schemas(
+                data, workflow_bundle
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
 
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -317,9 +542,9 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
                 name, version, description, author, author_email,
                 organization, license, repository_url, documentation_url,
                 tags, input_schema, output_schema, workflow_type,
-                workflow_hash, dependencies, python_version, status,
+                workflow_hash, workflow_bundle, dependencies, python_version, status,
                 visibility, created_by, updated_by, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["name"],
@@ -332,10 +557,11 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
                 data.get("repository_url"),
                 data.get("documentation_url"),
                 json.dumps(data.get("tags", [])),
-                json.dumps(data.get("input_schema")),
-                json.dumps(data.get("output_schema")),
+                json.dumps(input_schema),
+                json.dumps(output_schema),
                 data.get("workflow_type", "notebook"),
                 data.get("workflow_hash"),
+                json.dumps(workflow_bundle) if workflow_bundle is not None else None,
                 json.dumps(data.get("dependencies", [])),
                 data.get("python_version"),
                 "active",
@@ -360,14 +586,47 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         conn = self._get_conn()
         cursor = conn.cursor()
 
+        normalized_updates = dict(updates)
+        if any(
+            key in updates
+            for key in (
+                "workflow_bundle",
+                "workflow_files",
+                "workflow_entrypoint",
+                "workflow_data",
+                "workflow_data_base64",
+                "dockerfile",
+                "docker_context_files",
+            )
+        ):
+            payload = {"workflow_type": updates.get("workflow_type", "notebook"), **updates}
+            try:
+                normalized_updates["workflow_bundle"] = _normalize_workflow_bundle(payload)
+            except ValueError as exc:
+                return {"error": str(exc)}, 400
+
         set_clauses = []
         params = []
 
-        for key, value in updates.items():
-            if key in ["tags", "dependencies", "metadata", "input_schema", "output_schema"]:
+        for key, value in normalized_updates.items():
+            if key in [
+                "tags",
+                "dependencies",
+                "metadata",
+                "input_schema",
+                "output_schema",
+                "workflow_bundle",
+            ]:
                 set_clauses.append(f"{key} = ?")
                 params.append(json.dumps(value))
-            elif key in ["description", "status", "visibility", "license"]:
+            elif key in [
+                "description",
+                "status",
+                "visibility",
+                "license",
+                "workflow_type",
+                "workflow_hash",
+            ]:
                 set_clauses.append(f"{key} = ?")
                 params.append(value)
 
@@ -658,15 +917,28 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         row = cursor.fetchone() or {}
         if row.get("simulations_table"):
             logger.debug("PostgreSQL catalog schema already initialized")
-            return
+        else:
+            schema_path = Path(__file__).parent.parent / "database" / "master_catalog_schema.sql"
+            with open(schema_path, "r") as f:
+                schema_sql = f.read()
 
-        schema_path = Path(__file__).parent.parent / "database" / "master_catalog_schema.sql"
-        with open(schema_path, "r") as f:
-            schema_sql = f.read()
+            cursor.execute(schema_sql)
+            conn.commit()
+            logger.info("PostgreSQL catalog schema created")
 
-        cursor.execute(schema_sql)
+        self._ensure_schema_extensions()
+
+    def _ensure_schema_extensions(self):
+        """Apply non-breaking schema upgrades for existing PostgreSQL databases."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            ALTER TABLE simulations
+            ADD COLUMN IF NOT EXISTS workflow_bundle JSONB
+            """
+        )
         conn.commit()
-        logger.info("PostgreSQL catalog schema created")
 
     def _check_session(self, session_id: str) -> bool:
         conn = self._get_conn()
@@ -798,7 +1070,14 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             return None, 404
 
         sim = dict(row)
-        for field in ["tags", "input_schema", "output_schema", "dependencies", "metadata"]:
+        for field in [
+            "tags",
+            "input_schema",
+            "output_schema",
+            "dependencies",
+            "metadata",
+            "workflow_bundle",
+        ]:
             sim[field] = self._normalize_json(sim.get(field))
 
         if sim.get("created_at"):
@@ -811,6 +1090,14 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
     def register_simulation(self, data, session_id):
         if not self._check_privilege(session_id, "catalog_update"):
             return {"error": "Insufficient privileges"}, 403
+
+        try:
+            workflow_bundle = _normalize_workflow_bundle(data)
+            input_schema, output_schema = _resolve_input_output_schemas(
+                data, workflow_bundle
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
 
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -837,10 +1124,10 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
                 name, version, description, author, author_email,
                 organization, license, repository_url, documentation_url,
                 tags, input_schema, output_schema, workflow_type,
-                workflow_hash, dependencies, python_version, status,
+                workflow_hash, workflow_bundle, dependencies, python_version, status,
                 visibility, created_by, updated_by, metadata
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                      %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+                      %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
             RETURNING id
             """,
             (
@@ -854,10 +1141,11 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
                 data.get("repository_url"),
                 data.get("documentation_url"),
                 json.dumps(data.get("tags", [])),
-                json.dumps(data.get("input_schema")),
-                json.dumps(data.get("output_schema")),
+                json.dumps(input_schema),
+                json.dumps(output_schema),
                 data.get("workflow_type", "notebook"),
                 data.get("workflow_hash"),
+                json.dumps(workflow_bundle) if workflow_bundle is not None else None,
                 json.dumps(data.get("dependencies", [])),
                 data.get("python_version"),
                 "active",
@@ -878,14 +1166,47 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         if not self._check_privilege(session_id, "catalog_update"):
             return {"error": "Insufficient privileges"}, 403
 
+        normalized_updates = dict(updates)
+        if any(
+            key in updates
+            for key in (
+                "workflow_bundle",
+                "workflow_files",
+                "workflow_entrypoint",
+                "workflow_data",
+                "workflow_data_base64",
+                "dockerfile",
+                "docker_context_files",
+            )
+        ):
+            payload = {"workflow_type": updates.get("workflow_type", "notebook"), **updates}
+            try:
+                normalized_updates["workflow_bundle"] = _normalize_workflow_bundle(payload)
+            except ValueError as exc:
+                return {"error": str(exc)}, 400
+
         set_clauses = []
         params = []
 
-        for key, value in updates.items():
-            if key in ["tags", "dependencies", "metadata", "input_schema", "output_schema"]:
+        for key, value in normalized_updates.items():
+            if key in [
+                "tags",
+                "dependencies",
+                "metadata",
+                "input_schema",
+                "output_schema",
+                "workflow_bundle",
+            ]:
                 set_clauses.append(f"{key} = %s::jsonb")
                 params.append(json.dumps(value))
-            elif key in ["description", "status", "visibility", "license"]:
+            elif key in [
+                "description",
+                "status",
+                "visibility",
+                "license",
+                "workflow_type",
+                "workflow_hash",
+            ]:
                 set_clauses.append(f"{key} = %s")
                 params.append(value)
 

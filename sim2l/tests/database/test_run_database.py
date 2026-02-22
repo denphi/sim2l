@@ -31,13 +31,17 @@ class TestRunDatabaseInit:
             assert run_db.db_path == db_path
             assert run_db.conn is not None
 
-    def test_default_db_path(self):
-        """Test default database path creation."""
+    def test_default_db_path(self, monkeypatch, tmp_path):
+        """Test default database path creation under an isolated HOME."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(fake_home))
+
         execution_id = "test-exec-002"
 
         run_db = RunDatabase(execution_id)
 
-        expected_path = Path.home() / ".sim2l" / "runs" / f"{execution_id}.db"
+        expected_path = fake_home / ".sim2l" / "runs" / f"{execution_id}.db"
         assert run_db.db_path == str(expected_path)
         assert os.path.exists(run_db.db_path)
 
