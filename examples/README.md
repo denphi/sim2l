@@ -2,6 +2,9 @@
 
 This directory contains comprehensive examples demonstrating sim2l's capabilities.
 
+Note: example runs generate local artifacts (`*.db`, `*workflow_report*.html`) that
+are runtime outputs and are not part of the curated examples.
+
 ## Examples Overview
 
 ### 0. Complete Workflow Example ⭐ RECOMMENDED

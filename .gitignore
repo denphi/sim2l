@@ -79,6 +79,7 @@ target/
 # Local runtime artifacts
 *.sqlite
 *.sqlite3
+*.db
 *.db-wal
 *.db-shm
 datasim2l
