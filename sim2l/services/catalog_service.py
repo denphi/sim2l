@@ -10,6 +10,7 @@ import sys
 import argparse
 import logging
 import threading
+import json
 from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
@@ -617,6 +618,520 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             return {"status": "unhealthy", "error": "Internal error"}, 500
 
 
+class PostgreSQLCatalogBackend(CatalogServiceBackend):
+    """PostgreSQL backend for catalog service.
+
+    Uses a per-thread connection pool (threading.local) for thread safety
+    under concurrent Flask requests.
+    """
+
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self._local = threading.local()
+        self._create_schema()
+
+    def _get_conn(self):
+        """Return the per-thread PostgreSQL connection, creating it if needed."""
+        import psycopg2
+        import psycopg2.extras
+
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg2.connect(
+                self.connection_string,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+            self._local.conn = conn
+        return conn
+
+    def _create_schema(self):
+        """Create catalog schema if needed.
+
+        The PostgreSQL schema file contains some non-idempotent statements
+        (e.g., trigger creation). To avoid duplicate-object failures on
+        service restart, only apply the schema on first initialization.
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT to_regclass('public.simulations') AS simulations_table")
+        row = cursor.fetchone() or {}
+        if row.get("simulations_table"):
+            logger.debug("PostgreSQL catalog schema already initialized")
+            return
+
+        schema_path = Path(__file__).parent.parent / "database" / "master_catalog_schema.sql"
+        with open(schema_path, "r") as f:
+            schema_sql = f.read()
+
+        cursor.execute(schema_sql)
+        conn.commit()
+        logger.info("PostgreSQL catalog schema created")
+
+    def _check_session(self, session_id: str) -> bool:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1 FROM sessions
+            WHERE session_id = %s
+            AND is_valid = true
+            AND expires_at > CURRENT_TIMESTAMP
+            """,
+            (session_id,),
+        )
+        return cursor.fetchone() is not None
+
+    def _check_privilege(self, session_id: str, privilege: str) -> bool:
+        # Allow no-auth-session to have all privileges
+        if session_id == "no-auth-session":
+            return True
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT privileges FROM sessions
+            WHERE session_id = %s
+            AND is_valid = true
+            AND expires_at > CURRENT_TIMESTAMP
+            """,
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+
+        privileges = row.get("privileges") or []
+        if isinstance(privileges, str):
+            try:
+                privileges = json.loads(privileges)
+            except Exception:
+                privileges = []
+
+        return privilege in privileges or "admin" in privileges
+
+    def _normalize_json(self, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    def search(self, query, tags, status, limit):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        conditions = []
+        params = []
+
+        if query:
+            conditions.append("name ILIKE %s")
+            params.append(f"%{query}%")
+
+        if status and status != "all":
+            conditions.append("status = %s")
+            params.append(status)
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+        cursor.execute(
+            f"""
+            SELECT id, name, version, description, author, tags, status,
+                   created_at, updated_at
+            FROM simulations
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            params + [limit],
+        )
+
+        results = []
+        for row in cursor.fetchall():
+            sim = dict(row)
+            sim["tags"] = self._normalize_json(sim.get("tags")) or []
+
+            # Filter by tags if specified
+            if tags:
+                sim_tags = set(sim["tags"]) if isinstance(sim["tags"], list) else set()
+                if not sim_tags.intersection(set(tags)):
+                    continue
+
+            if sim.get("created_at"):
+                sim["created_at"] = str(sim["created_at"])
+            if sim.get("updated_at"):
+                sim["updated_at"] = str(sim["updated_at"])
+
+            results.append(sim)
+
+        return results, 200
+
+    def get_simulation(self, name, version):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if version:
+            cursor.execute(
+                """
+                SELECT * FROM simulations
+                WHERE name = %s AND version = %s
+                """,
+                (name, version),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM simulations
+                WHERE name = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (name,),
+            )
+
+        row = cursor.fetchone()
+        if not row:
+            return None, 404
+
+        sim = dict(row)
+        for field in ["tags", "input_schema", "output_schema", "dependencies", "metadata"]:
+            sim[field] = self._normalize_json(sim.get(field))
+
+        if sim.get("created_at"):
+            sim["created_at"] = str(sim["created_at"])
+        if sim.get("updated_at"):
+            sim["updated_at"] = str(sim["updated_at"])
+
+        return sim, 200
+
+    def register_simulation(self, data, session_id):
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if session_id == "no-auth-session":
+            user_id = None
+        else:
+            cursor.execute(
+                "SELECT user_id FROM sessions WHERE session_id = %s", (session_id,)
+            )
+            user_row = cursor.fetchone()
+            user_id = user_row["user_id"] if user_row else None
+
+        cursor.execute(
+            "SELECT id FROM simulations WHERE name = %s AND version = %s",
+            (data["name"], data["version"]),
+        )
+        if cursor.fetchone():
+            return {"error": "Simulation already registered"}, 409
+
+        cursor.execute(
+            """
+            INSERT INTO simulations (
+                name, version, description, author, author_email,
+                organization, license, repository_url, documentation_url,
+                tags, input_schema, output_schema, workflow_type,
+                workflow_hash, dependencies, python_version, status,
+                visibility, created_by, updated_by, metadata
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
+                      %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+            RETURNING id
+            """,
+            (
+                data["name"],
+                data["version"],
+                data.get("description"),
+                data.get("author"),
+                data.get("author_email"),
+                data.get("organization"),
+                data.get("license"),
+                data.get("repository_url"),
+                data.get("documentation_url"),
+                json.dumps(data.get("tags", [])),
+                json.dumps(data.get("input_schema")),
+                json.dumps(data.get("output_schema")),
+                data.get("workflow_type", "notebook"),
+                data.get("workflow_hash"),
+                json.dumps(data.get("dependencies", [])),
+                data.get("python_version"),
+                "active",
+                data.get("visibility", "public"),
+                user_id,
+                user_id,
+                json.dumps(data.get("metadata")),
+            ),
+        )
+
+        simulation_id = cursor.fetchone()["id"]
+        conn.commit()
+
+        logger.info(f"Registered simulation {data['name']}/{data['version']} (ID: {simulation_id})")
+        return {"id": simulation_id, "status": "registered"}, 201
+
+    def update_simulation(self, simulation_id, updates, session_id):
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        set_clauses = []
+        params = []
+
+        for key, value in updates.items():
+            if key in ["tags", "dependencies", "metadata", "input_schema", "output_schema"]:
+                set_clauses.append(f"{key} = %s::jsonb")
+                params.append(json.dumps(value))
+            elif key in ["description", "status", "visibility", "license"]:
+                set_clauses.append(f"{key} = %s")
+                params.append(value)
+
+        if not set_clauses:
+            return {"error": "No valid fields to update"}, 400
+
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(simulation_id)
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE simulations SET {', '.join(set_clauses)} WHERE id = %s",
+            params,
+        )
+        conn.commit()
+
+        return {"status": "updated"}, 200
+
+    def delete_simulation(self, simulation_id, session_id):
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT id, name, version FROM simulations WHERE id = %s",
+            (simulation_id,),
+        )
+        simulation = cursor.fetchone()
+        if not simulation:
+            return {"error": "Simulation not found"}, 404
+
+        cursor.execute("DELETE FROM execution_registry WHERE simulation_id = %s", (simulation_id,))
+        cursor.execute("DELETE FROM execution_stats WHERE simulation_id = %s", (simulation_id,))
+        cursor.execute("DELETE FROM simulation_tags WHERE simulation_id = %s", (simulation_id,))
+        cursor.execute("DELETE FROM access_control WHERE simulation_id = %s", (simulation_id,))
+        cursor.execute(
+            "DELETE FROM simulation_dependencies WHERE simulation_id = %s OR depends_on_simulation_id = %s",
+            (simulation_id, simulation_id),
+        )
+        cursor.execute("DELETE FROM simulations WHERE id = %s", (simulation_id,))
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        if deleted_count == 0:
+            return {"error": "Simulation not found"}, 404
+
+        logger.info(
+            f"Deleted simulation {simulation['name']}/{simulation['version']} (ID: {simulation_id})"
+        )
+        return {
+            "status": "deleted",
+            "simulation_id": simulation_id,
+            "name": simulation["name"],
+            "version": simulation["version"],
+        }, 200
+
+    def record_execution(self, data):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO execution_registry (
+                execution_id, squid_id, simulation_id, user_id,
+                started_at, completed_at, duration_seconds, status,
+                executor_type, cache_hit, run_db_path, run_db_size_bytes,
+                input_hash, output_count, artifact_count,
+                error_count, warning_count, environment
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                data["execution_id"],
+                data["squid_id"],
+                data["simulation_id"],
+                data.get("user_id"),
+                data["started_at"],
+                data.get("completed_at"),
+                data.get("duration_seconds"),
+                data["status"],
+                data["executor_type"],
+                data.get("cache_hit", False),
+                data.get("run_db_path"),
+                data.get("run_db_size_bytes"),
+                data.get("input_hash"),
+                data.get("output_count", 0),
+                data.get("artifact_count", 0),
+                data.get("error_count", 0),
+                data.get("warning_count", 0),
+                json.dumps(data.get("environment")),
+            ),
+        )
+
+        conn.commit()
+        return {"status": "recorded"}, 201
+
+    def get_stats(self, simulation_id):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) as total_executions,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN cache_hit = true THEN 1 ELSE 0 END) as cached,
+                AVG(duration_seconds) as avg_duration,
+                MIN(duration_seconds) as min_duration,
+                MAX(duration_seconds) as max_duration
+            FROM execution_registry
+            WHERE simulation_id = %s
+            """,
+            (simulation_id,),
+        )
+
+        row = cursor.fetchone()
+        if row:
+            return dict(row), 200
+        return {}, 404
+
+    def sync_pending_requests(self, installation_id):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if installation_id:
+            cursor.execute(
+                """
+                SELECT * FROM sync_queue
+                WHERE installation_id = %s
+                AND status = 'pending'
+                ORDER BY created_at
+                """,
+                (installation_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT * FROM sync_queue
+                WHERE status = 'pending'
+                ORDER BY created_at
+                """
+            )
+
+        results = [dict(row) for row in cursor.fetchall()]
+        return results, 200
+
+    def approve_sync(self, request_id, session_id):
+        if not self._check_privilege(session_id, "admin"):
+            return {"error": "Admin privilege required"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM sync_queue WHERE id = %s", (request_id,))
+        sync_request = cursor.fetchone()
+        if not sync_request:
+            return {"error": "Request not found"}, 404
+
+        payload = self._normalize_json(sync_request.get("payload")) or {}
+        result, status = self.register_simulation(payload, session_id)
+
+        if status == 201:
+            cursor.execute(
+                """
+                UPDATE sync_queue
+                SET status = 'approved',
+                    processed_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (request_id,),
+            )
+            conn.commit()
+            return {"status": "approved", "simulation_id": result["id"]}, 200
+
+        cursor.execute(
+            """
+            UPDATE sync_queue
+            SET status = 'failed',
+                processed_at = CURRENT_TIMESTAMP,
+                rejection_reason = %s
+            WHERE id = %s
+            """,
+            (result.get("error", "Unknown error"), request_id),
+        )
+        conn.commit()
+        return result, status
+
+    def get_overview_stats(self):
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT COUNT(*) AS count FROM simulations")
+            total_simulations = (cursor.fetchone() or {}).get("count", 0)
+
+            cursor.execute("SELECT COUNT(*) AS count FROM simulations WHERE status = 'active'")
+            active_simulations = (cursor.fetchone() or {}).get("count", 0)
+
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) as total_executions,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as successful_executions,
+                    SUM(CASE WHEN cache_hit = true THEN 1 ELSE 0 END) as cached_executions
+                FROM execution_registry
+                """
+            )
+            exec_stats = cursor.fetchone() or {}
+
+            return {
+                "total_simulations": total_simulations or 0,
+                "active_simulations": active_simulations or 0,
+                "total_executions": exec_stats.get("total_executions", 0) or 0,
+                "successful_executions": exec_stats.get("successful_executions", 0) or 0,
+                "cached_executions": exec_stats.get("cached_executions", 0) or 0,
+            }, 200
+        except Exception as e:
+            logger.error(f"Error getting overview stats: {e}", exc_info=True)
+            return {
+                "total_simulations": 0,
+                "active_simulations": 0,
+                "total_executions": 0,
+                "successful_executions": 0,
+                "cached_executions": 0,
+            }, 200
+
+    def health_check(self):
+        try:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) AS count FROM simulations")
+            row = cursor.fetchone() or {}
+            count = row.get("count", 0) or 0
+            return {
+                "status": "healthy",
+                "backend": "postgresql",
+                "simulations": count,
+            }, 200
+        except Exception as e:
+            logger.error(f"Health check failed: {e}", exc_info=True)
+            return {"status": "unhealthy", "error": "Internal error"}, 500
+
+
 # REST API Endpoints
 @app.route("/health", methods=["GET"])
 def health():
@@ -852,8 +1367,8 @@ def main():
         if not args.db_url:
             logger.error("PostgreSQL backend requires --db-url")
             sys.exit(1)
-        logger.error("PostgreSQL backend not yet implemented for catalog")
-        sys.exit(1)
+        catalog_db = PostgreSQLCatalogBackend(args.db_url)
+        logger.info("Using PostgreSQL backend")
 
     logger.info(f"Starting catalog service on {args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False)
