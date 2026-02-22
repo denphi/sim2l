@@ -22,40 +22,8 @@ class FileManager:
     """
     Manages files and folders using the cache service.
 
-    Features:
-    - File metadata storage (name, size, URI, timestamps)
-    - Folder hierarchy management
-    - File operations (create, read, update, delete, move)
-    - Search and filtering
-    - Integration with cache service for distributed access
-
-    Usage:
-        # Local mode (in-memory)
-        fm = FileManager()
-
-        # Remote mode (cache service)
-        session = get_session_manager().create_anonymous_session()
-        fm = FileManager(
-            cache_url="http://localhost:8001",
-            session_id=session.session_id
-        )
-
-        # Create a file
-        file = fm.create_file(
-            name="output.dat",
-            size=1024,
-            uri="/path/to/file",
-            creator="user123"
-        )
-
-        # Find a file
-        file = fm.get_file(file['id'])
-
-        # Update file
-        fm.update_file(file['id'], size=2048)
-
-        # Delete file
-        fm.delete_file(file['id'])
+    Supports metadata storage, folder hierarchy management, and file operations
+    backed by local cache or the remote cache service.
     """
 
     def __init__(
@@ -399,12 +367,6 @@ class FileManager:
 
         Returns:
             List of file dictionaries with metadata
-
-        Example:
-            fm = FileManager()
-            files = fm.get_run_files("exec-2024-001")
-            for file in files:
-                print(f"{file['name']}: {file['size']} bytes")
         """
         from .run_database import RunDatabase
 
@@ -453,13 +415,6 @@ class FileManager:
 
         Returns:
             List of file dictionaries
-
-        Example:
-            fm = FileManager(
-                cache_url="http://localhost:8001",
-                session_id=session.session_id
-            )
-            files = fm.get_simulation_files("thermal_sim", "1.0.0")
         """
         from .catalog_client import CatalogClient
         from .run_database import RunDatabase
@@ -510,14 +465,6 @@ class FileManager:
 
         Returns:
             True if successful, False otherwise
-
-        Example:
-            fm = FileManager()
-            fm.export_run_file(
-                "exec-2024-001",
-                "output.dat",
-                "/tmp/output.dat"
-            )
         """
         from .run_database import RunDatabase
 
@@ -556,10 +503,8 @@ class FileManager:
         Search for files/folders matching criteria.
 
         Not implemented: the cache service does not support arbitrary queries.
-        To search files, either:
-          1. Maintain a separate index of file IDs.
-          2. Use the catalog service.
-          3. Track file IDs in your own data structure.
+        To search files, either maintain a separate index, use the catalog
+        service, or track file IDs in your own data structure.
 
         Raises:
             NotImplementedError: Always.

@@ -21,34 +21,8 @@ class ResultsClient:
     """
     Client for the sim2l Results Service.
 
-    The Results Service introspects simulation runs and stores parameter
-    values in a searchable database, enabling powerful queries like:
-    - Find all runs where temperature > 300
-    - Get statistics for an output parameter across runs
-    - Search by combinations of input/output values
-
-    Usage:
-        client = ResultsClient(
-            "http://localhost:8003",
-            session_id=session.session_id
-        )
-
-        # Register a result
-        client.register_result("exec-2024-001")
-
-        # Search for results
-        results = client.search(
-            simulation_name="thermal_sim",
-            input_filters={'temperature': 350},
-            output_filters={'max_stress': {'$gt': 100}}
-        )
-
-        # Get parameter statistics
-        stats = client.get_parameter_stats(
-            "thermal_sim",
-            "max_stress",
-            param_class="output"
-        )
+    The service introspects simulation runs and stores searchable input/output
+    parameter values for query and analytics.
     """
 
     def __init__(
@@ -113,10 +87,6 @@ class ResultsClient:
 
         Returns:
             Dict with result_id and schema_id
-
-        Example:
-            result = client.register_result("exec-2024-001")
-            print(f"Registered as result ID: {result['result_id']}")
         """
         try:
             response = requests.post(
@@ -153,19 +123,6 @@ class ResultsClient:
 
         Returns:
             List of matching results
-
-        Example:
-            # Find runs with specific input values
-            results = client.search(
-                simulation_name="thermal_sim",
-                input_filters={'temperature': 350, 'pressure': 100}
-            )
-
-            # Find runs with output in range (requires PostgreSQL)
-            results = client.search(
-                simulation_name="thermal_sim",
-                output_filters={'max_stress': 150}
-            )
         """
         try:
             response = requests.post(
@@ -195,11 +152,6 @@ class ResultsClient:
 
         Returns:
             Result dict or None if not found
-
-        Example:
-            result = client.get_result("exec-2024-001")
-            print(f"Inputs: {result['input_params']}")
-            print(f"Outputs: {result['output_params']}")
         """
         try:
             response = requests.get(
@@ -233,15 +185,6 @@ class ResultsClient:
 
         Returns:
             Dict with min, max, avg, count
-
-        Example:
-            stats = client.get_parameter_stats(
-                "thermal_sim",
-                "max_stress",
-                param_class="output"
-            )
-            print(f"Average: {stats['avg_value']}")
-            print(f"Range: {stats['min_value']} - {stats['max_value']}")
         """
         try:
             response = requests.get(

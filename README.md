@@ -11,7 +11,6 @@ sim2l is a modular, notebook-agnostic library for defining, deploying, and execu
 - **Pluggable executors**: Local, notebook (Papermill), HUB submit, and extensible
 - **Smart caching**: Automatic result caching based on inputs
 - **Full provenance**: Track all executions with complete metadata
-- **Migration tools**: Easy migration from simtool
 
 ## Quick Start
 
@@ -69,7 +68,6 @@ print(f"Current: {result.outputs.current}")
 See the `docs/` directory for:
 - [Architecture](docs/sim2l_architecture.md)
 - [Quick Reference](docs/sim2l_quick_reference.md)
-- [Migration Guide](docs/sim2l_architecture.md#migration-from-simtool-to-sim2l)
 
 ## License
 

@@ -45,7 +45,6 @@ Contents
    :caption: Additional Information
 
    deployment
-   migration
    contributing
    authors
    history
