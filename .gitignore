@@ -95,3 +95,4 @@ web-ui/.vite/
 web-ui/.env
 web-ui/.env.local
 web-ui/.env.*.local
+web-ui/package-lock.json

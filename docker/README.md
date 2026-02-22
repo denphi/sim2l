@@ -45,6 +45,25 @@ docker-compose logs -f catalog-postgres
 docker-compose --profile prod down
 ```
 
+### Integration Tests (PostgreSQL only)
+
+From the repository root:
+
+```bash
+./start_postgres_services.sh
+python3 -m pytest -vv sim2l/tests/test_postgres_catalog_integration.py
+python3 -m pytest -vv tests/test_catalog_postgres_backend_integration.py
+./stop_postgres_services.sh
+```
+
+The startup script ensures these databases exist:
+- `sim2l_cache`
+- `sim2l_catalog`
+- `sim2l_results`
+- `sim2l_test`
+
+If `localhost:5432` already has a reachable PostgreSQL instance, the script reuses it.
+
 ## Service Modes
 
 ### SQLite Mode (Development)

@@ -20,12 +20,6 @@ import pytest
 # Connection helpers
 # ---------------------------------------------------------------------------
 
-DEFAULT_POSTGRES_URL = os.environ.get(
-    "POSTGRES_URL",
-    "postgresql://sim2l:sim2l_password@localhost:5432/sim2l_test",
-)
-
-
 def _check_postgres(url: str) -> bool:
     """Return True if a PostgreSQL connection can be established."""
     try:
@@ -37,19 +31,76 @@ def _check_postgres(url: str) -> bool:
         return False
 
 
-def _make_test_db_url() -> str:
-    """Return a URL pointing to an isolated test database."""
-    base = DEFAULT_POSTGRES_URL.rsplit("/", 1)[0]
-    return f"{base}/sim2l_test"
+def _candidate_postgres_bases() -> list[str]:
+    """Return PostgreSQL base URLs to try, in priority order."""
+    candidates = []
+
+    env_url = os.environ.get("POSTGRES_URL")
+    if env_url:
+        candidates.append(env_url.rsplit("/", 1)[0])
+
+    candidates.extend(
+        [
+            "postgresql://sim2l:sim2l_password@localhost:5432",
+        ]
+    )
+
+    # Preserve order while removing duplicates.
+    seen = set()
+    unique = []
+    for base in candidates:
+        if base not in seen:
+            unique.append(base)
+            seen.add(base)
+    return unique
+
+
+def _detect_postgres_test_url() -> str | None:
+    """
+    Detect a reachable PostgreSQL base and ensure `sim2l_test` exists.
+
+    Returns:
+        Full URL to `sim2l_test` if reachable, else None.
+    """
+    try:
+        import psycopg2
+        from psycopg2 import sql
+    except Exception:
+        return None
+
+    for base in _candidate_postgres_bases():
+        try:
+            admin = psycopg2.connect(f"{base}/postgres", connect_timeout=3)
+            admin.autocommit = True
+            cur = admin.cursor()
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", ("sim2l_test",))
+            if cur.fetchone() is None:
+                cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier("sim2l_test")))
+            cur.close()
+            admin.close()
+
+            test_url = f"{base}/sim2l_test"
+            if _check_postgres(test_url):
+                return test_url
+        except Exception:
+            continue
+
+    return None
 
 
 # Module-level skip if PostgreSQL is not available
-postgres_url = _make_test_db_url()
-postgres_available = _check_postgres(postgres_url)
+_detected_postgres_url = _detect_postgres_test_url()
+postgres_url = _detected_postgres_url or (
+    _candidate_postgres_bases()[0] + "/sim2l_test"
+)
+postgres_available = _detected_postgres_url is not None
 
 pytestmark = pytest.mark.skipif(
     not postgres_available,
-    reason=f"PostgreSQL not reachable at {postgres_url} — skipping integration tests",
+    reason=(
+        f"PostgreSQL not reachable at {postgres_url} — "
+        "start it with ./start_postgres_services.sh"
+    ),
 )
 
 

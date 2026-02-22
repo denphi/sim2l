@@ -6,7 +6,7 @@ services:
     container_name: sim2l_postgres
     environment:
       POSTGRES_USER: sim2l
-      POSTGRES_PASSWORD: sim2l_dev_password
+      POSTGRES_PASSWORD: sim2l_password
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"

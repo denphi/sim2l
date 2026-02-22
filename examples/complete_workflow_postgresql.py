@@ -53,7 +53,7 @@ from html_report_generator import HTMLReportGenerator
 POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
 POSTGRES_PORT = os.getenv('POSTGRES_PORT', '5432')
 POSTGRES_USER = os.getenv('POSTGRES_USER', 'sim2l')
-POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'sim2l_dev_password')
+POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', 'sim2l_password')
 
 # Database URLs
 CACHE_DB_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/sim2l_cache"
