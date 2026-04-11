@@ -9,6 +9,7 @@ import numpy as np
 
 from .field import Field
 from ..utils.units import get_unit_registry
+from pint import Quantity
 
 
 class Integer(Field):
@@ -80,7 +81,7 @@ class Number(Field):
         self.min = min
         self.max = max
 
-    def validate(self, value: Any) -> Union[float, 'Quantity']:
+    def validate(self, value: Any) -> Union[float, Quantity]:
         """Validate number with optional units"""
         ureg = get_unit_registry()
 
@@ -383,16 +384,18 @@ class Element(Field):
         """Validate element"""
         import mendeleev
 
-        if isinstance(value, str):
+        # Already a mendeleev element object (e.g. re-validation via value setter)
+        if hasattr(value, 'symbol'):
+            symbol = value.symbol
+            element = value
+        elif isinstance(value, str):
             symbol = value
+            try:
+                element = mendeleev.element(symbol)
+            except Exception:
+                raise ValueError(f"Unknown element: {symbol}")
         else:
-            symbol = str(value)
-
-        # Validate element exists
-        try:
-            element = mendeleev.element(symbol)
-        except Exception:
-            raise ValueError(f"Unknown element: {symbol}")
+            raise ValueError(f"Cannot convert {type(value)} to element")
 
         if self.choices and symbol not in self.choices:
             raise ValueError(f"Element '{symbol}' not in allowed choices: {self.choices}")

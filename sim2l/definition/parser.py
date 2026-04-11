@@ -21,7 +21,7 @@ def parse_notebook(notebook_path: Path) -> Tuple[InputSchema, OutputSchema, byte
     Returns:
         Tuple of (input_schema, output_schema, notebook_bytes)
     """
-    with open(notebook_path, 'r') as f:
+    with open(notebook_path, "r", encoding="utf-8") as f:
         notebook = json.load(f)
 
     # Extract schemas from cells
