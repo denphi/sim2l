@@ -11,19 +11,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY sim2l /app/sim2l
 
 # Expose port
-EXPOSE 8002
+EXPOSE 8003
 
 # Default to SQLite backend
 ENV BACKEND=sqlite
-ENV DB_PATH=/data/catalog.db
+ENV DB_PATH=/data/results.db
 ENV HOST=0.0.0.0
-ENV PORT=8002
+ENV PORT=8003
 
 # Create data directory
 RUN mkdir -p /data
 
-# Run catalog service
-CMD python -m sim2l.services.catalog_service \
+# Run results service
+CMD python -m sim2l.services.results_service \
     --backend ${BACKEND} \
     --db-path ${DB_PATH} \
     --host ${HOST} \

@@ -2,11 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies
-RUN pip install --no-cache-dir \
-    flask \
-    requests \
-    psycopg2-binary
+# Copy requirements and install dependencies
+COPY requirements.txt /app/
+COPY requirements/ /app/requirements/
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy sim2l package
 COPY sim2l /app/sim2l
