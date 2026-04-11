@@ -16,6 +16,11 @@ export interface CacheEntry {
   status: 'valid' | 'invalidated';
   invalidated_at?: string | null;
   invalidation_reason?: string | null;
+  metadata?: {
+    inputs?: Record<string, any>;
+    [key: string]: any;
+  };
+  run_db_path?: string;
 }
 
 export interface CacheStats {

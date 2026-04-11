@@ -8,6 +8,8 @@ mendeleev
 pillow
 joblib
 nbsphinx
+bcrypt
+sqlalchemy
 # Database services dependencies
 flask
 requests

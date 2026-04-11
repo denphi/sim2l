@@ -36,6 +36,10 @@ services:
     profiles:
       - sqlite
       - dev
+    networks:
+      default:
+        aliases:
+          - cache
 
   # Cache service (PostgreSQL mode - for production)
   cache-postgres:
@@ -55,6 +59,10 @@ services:
     profiles:
       - postgresql
       - prod
+    networks:
+      default:
+        aliases:
+          - cache
 
   # Catalog service (SQLite mode - for development)
   catalog-sqlite:
@@ -73,6 +81,10 @@ services:
     profiles:
       - sqlite
       - dev
+    networks:
+      default:
+        aliases:
+          - catalog
 
   # Catalog service (PostgreSQL mode - for production)
   catalog-postgres:
@@ -92,8 +104,94 @@ services:
     profiles:
       - postgresql
       - prod
+    networks:
+      default:
+        aliases:
+          - catalog
+
+  # Results service (SQLite mode - for development)
+  results-sqlite:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.results
+    environment:
+      BACKEND: sqlite
+      DB_PATH: /data/results.db
+      HOST: 0.0.0.0
+      PORT: 8003
+    volumes:
+      - results_data:/data
+    ports:
+      - "8003:8003"
+    profiles:
+      - sqlite
+      - dev
+    networks:
+      default:
+        aliases:
+          - results
+
+  # Results service (PostgreSQL mode - for production)
+  results-postgres:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.results
+    environment:
+      BACKEND: postgresql
+      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_results
+      HOST: 0.0.0.0
+      PORT: 8003
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - postgresql
+      - prod
+    networks:
+      default:
+        aliases:
+          - results
+
+  # Web UI
+  web-ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - cache-sqlite
+      - catalog-sqlite
+      - results-sqlite
+    profiles:
+      - dev
+    networks:
+      default:
+        aliases:
+          - web-ui
+
+  # Web UI (Production mode)
+  web-ui-prod:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web-ui
+    ports:
+      - "3000:3000"
+    depends_on:
+      - cache-postgres
+      - catalog-postgres
+      - results-postgres
+    profiles:
+      - prod
+    networks:
+      default:
+        aliases:
+          - web-ui
 
 volumes:
   postgres_data:
   cache_data:
   catalog_data:
+  results_data:

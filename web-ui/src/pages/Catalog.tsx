@@ -19,6 +19,7 @@ import {
   Button,
   Card,
   CardContent,
+  Collapse,
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -26,6 +27,8 @@ import {
   Pause as PauseIcon,
   Error as ErrorIcon,
   Delete as DeleteIcon,
+  KeyboardArrowDown as KeyboardArrowDownIcon,
+  KeyboardArrowUp as KeyboardArrowUpIcon,
 } from '@mui/icons-material';
 import { catalogService } from '../api/catalogService';
 import { SubmitRunModal } from '../components/catalog/SubmitRunModal';
@@ -41,11 +44,24 @@ export function Catalog() {
   const [selectedSimName, setSelectedSimName] = useState('');
   const [selectedSimVersion, setSelectedSimVersion] = useState<string | undefined>(undefined);
   const [deletingSimulationId, setDeletingSimulationId] = useState<number | null>(null);
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
 
   const handleOpenRunModal = (name: string, version: string) => {
     setSelectedSimName(name);
     setSelectedSimVersion(version);
     setRunModalOpen(true);
+  };
+
+  const handleToggleRow = (simKey: string) => {
+    setExpandedRows(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(simKey)) {
+        newSet.delete(simKey);
+      } else {
+        newSet.add(simKey);
+      }
+      return newSet;
+    });
   };
 
   useEffect(() => {
@@ -222,6 +238,7 @@ export function Catalog() {
             <Table>
               <TableHead>
                 <TableRow>
+                  <TableCell width="50px" />
                   <TableCell>Name</TableCell>
                   <TableCell>Version</TableCell>
                   <TableCell>Status</TableCell>
@@ -235,7 +252,7 @@ export function Catalog() {
               <TableBody>
                 {simulations.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center">
+                    <TableCell colSpan={9} align="center">
                       <Typography color="textSecondary" py={4}>
                         {searchTerm
                           ? 'No simulations found matching your search'
@@ -244,69 +261,150 @@ export function Catalog() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  simulations.map((sim) => (
-                    <TableRow key={`${sim.name}-${sim.version}`} hover>
-                      <TableCell>
-                        <Typography variant="body2" fontWeight="medium">
-                          {sim.name}
-                        </Typography>
-                        {sim.id && (
-                          <Typography variant="caption" color="textSecondary">
-                            ID: {sim.id}
-                          </Typography>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        <Chip label={sim.version} size="small" variant="outlined" />
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          icon={getStatusIcon(sim.status)}
-                          label={sim.status || 'active'}
-                          color={getStatusColor(sim.status)}
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2" sx={{ maxWidth: 300 }}>
-                          {sim.description || 'No description'}
-                        </Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2">{sim.author || 'Unknown'}</Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2">{formatDate(sim.created_at)}</Typography>
-                      </TableCell>
-                      <TableCell>
-                        <Typography variant="body2">{formatDate(sim.updated_at)}</Typography>
-                      </TableCell>
-                      <TableCell align="center">
-                        <Box display="flex" gap={1} justifyContent="center" alignItems="center">
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            onClick={() => handleOpenRunModal(sim.name, sim.version)}
-                            disabled={sim.status !== 'active' || deletingSimulationId === sim.id}
-                          >
-                            Run
-                          </Button>
-                          <Tooltip title="Delete simulation">
-                            <span>
-                              <IconButton
-                                color="error"
+                  simulations.map((sim) => {
+                    const simKey = `${sim.name}-${sim.version}`;
+                    const isExpanded = expandedRows.has(simKey);
+                    return (
+                      <>
+                        <TableRow key={simKey} hover>
+                          <TableCell>
+                            <IconButton
+                              size="small"
+                              onClick={() => handleToggleRow(simKey)}
+                            >
+                              {isExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
+                            </IconButton>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" fontWeight="medium">
+                              {sim.name}
+                            </Typography>
+                            {sim.id && (
+                              <Typography variant="caption" color="textSecondary">
+                                ID: {sim.id}
+                              </Typography>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <Chip label={sim.version} size="small" variant="outlined" />
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              icon={getStatusIcon(sim.status)}
+                              label={sim.status || 'active'}
+                              color={getStatusColor(sim.status)}
+                              size="small"
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2" sx={{ maxWidth: 300 }}>
+                              {sim.description || 'No description'}
+                            </Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">{sim.author || 'Unknown'}</Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">{formatDate(sim.created_at)}</Typography>
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">{formatDate(sim.updated_at)}</Typography>
+                          </TableCell>
+                          <TableCell align="center">
+                            <Box display="flex" gap={1} justifyContent="center" alignItems="center">
+                              <Button
+                                variant="outlined"
                                 size="small"
-                                onClick={() => handleDeleteSimulation(sim)}
-                                disabled={deletingSimulationId === sim.id}
+                                onClick={() => handleOpenRunModal(sim.name, sim.version)}
+                                disabled={sim.status !== 'active' || deletingSimulationId === sim.id}
                               >
-                                <DeleteIcon fontSize="small" />
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                        </Box>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                                Run
+                              </Button>
+                              <Tooltip title="Delete simulation">
+                                <span>
+                                  <IconButton
+                                    color="error"
+                                    size="small"
+                                    onClick={() => handleDeleteSimulation(sim)}
+                                    disabled={deletingSimulationId === sim.id}
+                                  >
+                                    <DeleteIcon fontSize="small" />
+                                  </IconButton>
+                                </span>
+                              </Tooltip>
+                            </Box>
+                          </TableCell>
+                        </TableRow>
+                        <TableRow key={`${simKey}-expanded`}>
+                          <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={9}>
+                            <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                              <Box sx={{ margin: 2 }}>
+                                <Typography variant="h6" gutterBottom component="div">
+                                  Parameters
+                                </Typography>
+                                {sim.input_schema && Object.keys(sim.input_schema).length > 0 ? (
+                                  <Table size="small" aria-label="parameters">
+                                    <TableHead>
+                                      <TableRow>
+                                        <TableCell><strong>Parameter</strong></TableCell>
+                                        <TableCell><strong>Type</strong></TableCell>
+                                        <TableCell><strong>Description</strong></TableCell>
+                                        <TableCell><strong>Default</strong></TableCell>
+                                      </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                      {Object.entries(sim.input_schema).map(([key, schemaDef]: [string, any]) => (
+                                        <TableRow key={key}>
+                                          <TableCell component="th" scope="row">
+                                            <Typography variant="body2" fontWeight="medium">
+                                              {schemaDef.label || key}
+                                            </Typography>
+                                          </TableCell>
+                                          <TableCell>
+                                            <Chip 
+                                              label={schemaDef.type || 'string'} 
+                                              size="small" 
+                                              variant="outlined"
+                                            />
+                                          </TableCell>
+                                          <TableCell>
+                                            <Typography variant="body2" color="textSecondary">
+                                              {schemaDef.description || 'N/A'}
+                                            </Typography>
+                                          </TableCell>
+                                          <TableCell>
+                                            <Typography variant="body2">
+                                              {schemaDef.default !== undefined ? String(schemaDef.default) : 'N/A'}
+                                            </Typography>
+                                          </TableCell>
+                                        </TableRow>
+                                      ))}
+                                    </TableBody>
+                                  </Table>
+                                ) : (
+                                  <Typography variant="body2" color="textSecondary">
+                                    No parameters defined for this simulation.
+                                  </Typography>
+                                )}
+                                {sim.tags && sim.tags.length > 0 && (
+                                  <Box sx={{ mt: 2 }}>
+                                    <Typography variant="subtitle2" gutterBottom>
+                                      Tags:
+                                    </Typography>
+                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                                      {sim.tags.map((tag, idx) => (
+                                        <Chip key={idx} label={tag} size="small" />
+                                      ))}
+                                    </Box>
+                                  </Box>
+                                )}
+                              </Box>
+                            </Collapse>
+                          </TableCell>
+                        </TableRow>
+                      </>
+                    );
+                  })
                 )}
               </TableBody>
             </Table>

@@ -13,6 +13,7 @@ import os
 import sys
 import argparse
 import logging
+import json
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -385,7 +386,7 @@ class SQLiteCacheBackend(CacheServiceBackend):
             SELECT
                 cache_key, simulation_id, simulation_name, simulation_version,
                 execution_id, squid_id, input_hash, created_at, last_accessed,
-                access_count, hit_count, status
+                access_count, hit_count, status, metadata
             FROM cache_entries
             WHERE {where_clause}
             ORDER BY created_at DESC
@@ -409,6 +410,7 @@ class SQLiteCacheBackend(CacheServiceBackend):
                 "access_count": row["access_count"],
                 "hit_count": row["hit_count"],
                 "status": row["status"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
             })
 
         return {
@@ -726,7 +728,7 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
             SELECT
                 cache_key, simulation_id, simulation_name, simulation_version,
                 execution_id, squid_id, input_hash, created_at, last_accessed,
-                access_count, hit_count, size_bytes, status
+                access_count, hit_count, size_bytes, status, metadata
             FROM cache_entries
             WHERE {where_clause}
             ORDER BY created_at DESC
@@ -751,6 +753,7 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
                 "hit_count": row[10],
                 "size_bytes": row[11],
                 "status": row[12],
+                "metadata": row[13] if row[13] else None,
             })
 
         return {
