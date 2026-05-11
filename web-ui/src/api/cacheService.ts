@@ -59,6 +59,11 @@ export class CacheServiceClient {
     };
   }
 
+  async clearAllEntries(): Promise<{ deleted: number }> {
+    const response = await apiClient.cache.delete<{ deleted: number }>('/cache');
+    return response.data;
+  }
+
   async getHotEntries(limit: number = 10): Promise<{ entries: CacheEntry[] }> {
     try {
       const response = await apiClient.cache.get<{ entries: CacheEntry[] }>('/cache/hot', {

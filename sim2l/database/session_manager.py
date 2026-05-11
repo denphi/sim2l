@@ -6,6 +6,8 @@
 Session management for authentication and privilege checking.
 """
 
+import os
+import secrets
 import uuid
 import bcrypt
 from datetime import datetime, timezone, timedelta
@@ -13,6 +15,11 @@ from typing import Dict, List, Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dev_mode() -> bool:
+    """Return True when the process is started in dev/test mode."""
+    return os.environ.get("SIM2L_DEV_MODE", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _utcnow() -> datetime:
@@ -76,26 +83,70 @@ class SessionManager:
     or a dedicated session service (Redis, etc.).
     """
 
-    def __init__(self, default_ttl_hours: int = 24):
+    def __init__(self, default_ttl_hours: int = 24, *, dev_mode: Optional[bool] = None):
         self.default_ttl_hours = default_ttl_hours
+        # dev_mode=None means "honour the SIM2L_DEV_MODE env var"; pass True/False
+        # explicitly to override the env (used by tests).
+        self._dev_mode = _is_dev_mode() if dev_mode is None else dev_mode
         self._sessions: Dict[str, Session] = {}
         self._users: Dict[int, Dict[str, Any]] = {}
         self._username_to_id: Dict[str, int] = {}
         self._next_user_id = 1
 
-        # Create default admin user
+        # Create default admin user (password chosen by environment/dev-mode)
         self._create_default_admin()
 
+    def _resolve_admin_password(self) -> Optional[str]:
+        """Pick the admin password to use, or None to skip default-admin creation.
+
+        Resolution order:
+        1. ``SIM2L_ADMIN_PASSWORD`` env var: explicit operator-supplied password.
+        2. ``dev_mode`` (constructor arg or ``SIM2L_DEV_MODE`` env): use the
+           well-known literal ``"admin"`` so tests and local development work.
+        3. Otherwise: generate a random password, log it once, and use it.
+           This keeps the service starting in production deployments where
+           the operator forgot to set a password — but the credential is not
+           the well-known ``admin/admin``.
+        """
+        explicit = os.environ.get("SIM2L_ADMIN_PASSWORD")
+        if explicit:
+            return explicit
+        if self._dev_mode:
+            return "admin"
+        return None  # caller will substitute a random password
+
     def _create_default_admin(self):
-        """Create default admin user for local development."""
-        logger.warning(
-            "Default admin user created with password 'admin'. "
-            "Change this immediately in any non-development environment via create_user()."
-        )
+        """Create the default admin user.
+
+        The password depends on environment — see ``_resolve_admin_password``.
+        Production deployments without ``SIM2L_ADMIN_PASSWORD`` get a randomly
+        generated password printed once to the log, NOT the well-known
+        ``admin``. This avoids the "anyone with the codebase has admin"
+        footgun while still letting the service boot.
+        """
+        password = self._resolve_admin_password()
+        log_note: str
+        if password is None:
+            password = secrets.token_urlsafe(24)
+            log_note = (
+                f"Default admin user created with random password: {password!r}. "
+                f"Set SIM2L_ADMIN_PASSWORD to control this, or SIM2L_DEV_MODE=true "
+                f"to use the literal 'admin' for development/testing."
+            )
+            logger.warning(log_note)
+        elif self._dev_mode and password == "admin":
+            logger.warning(
+                "Default admin user created with password 'admin' (dev mode). "
+                "DO NOT use this configuration outside development."
+            )
+        else:
+            logger.info(
+                "Default admin user created with password from SIM2L_ADMIN_PASSWORD."
+            )
         admin_user = {
             "id": 1,
             "username": "admin",
-            "password_hash": self._hash_password("admin"),
+            "password_hash": self._hash_password(password),
             "role": "admin",
             "email": "admin@localhost",
         }
@@ -236,6 +287,27 @@ class SessionManager:
             return False
 
         return session.has_privilege(privilege)
+
+    def refresh_session(self, session_id: str, ttl_hours: Optional[int] = None) -> bool:
+        """Extend a session's expiry by the configured TTL.
+
+        Returns True if the session was found and refreshed, False otherwise.
+        """
+        session = self._sessions.get(session_id)
+        if session is None:
+            return False
+
+        if not session.is_valid():
+            del self._sessions[session_id]
+            return False
+
+        ttl = ttl_hours if ttl_hours is not None else self.default_ttl_hours
+        session.expires_at = _utcnow() + timedelta(hours=ttl)
+        session.update_activity()
+        logger.info(
+            f"Session {session_id[:8]}... refreshed, new expiry: {session.expires_at.isoformat()}"
+        )
+        return True
 
     def invalidate_session(self, session_id: str):
         """Invalidate a session."""

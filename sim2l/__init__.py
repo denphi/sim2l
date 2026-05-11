@@ -62,6 +62,7 @@ from .utils import (
 # Executors
 from .executor import (
     Executor,
+    IsolatedFunctionExecutor,
     LocalExecutor,
     NotebookExecutor,
 )
@@ -117,6 +118,7 @@ __all__ = [
 
     # Executors
     "Executor",
+    "IsolatedFunctionExecutor",
     "LocalExecutor",
     "NotebookExecutor",
 

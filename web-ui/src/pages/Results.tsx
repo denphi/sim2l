@@ -154,6 +154,21 @@ export function Results() {
     setTimeout(loadData, 0);
   };
 
+  const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      `Delete ALL results? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      const result = await resultsService.clearAllResults();
+      window.alert(`Cleared ${result.deleted} result(s).`);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to clear results:', error);
+      window.alert('Failed to clear results. See browser console for details.');
+    }
+  };
+
   const handleDeleteResult = async (result: ExecutionResult) => {
     const confirmed = window.confirm(
       `Delete result "${result.execution_id}" for ${result.simulation_name}/${result.simulation_version}?`
@@ -223,11 +238,21 @@ export function Results() {
     <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
         <Typography variant="h4">Results Service</Typography>
-        <Tooltip title="Refresh">
-          <IconButton onClick={loadData} color="primary">
-            <RefreshIcon />
-          </IconButton>
-        </Tooltip>
+        <Box display="flex" gap={1} alignItems="center">
+          <Button
+            variant="outlined"
+            color="error"
+            size="small"
+            onClick={handleClearAll}
+          >
+            Clear All
+          </Button>
+          <Tooltip title="Refresh">
+            <IconButton onClick={loadData} color="primary">
+              <RefreshIcon />
+            </IconButton>
+          </Tooltip>
+        </Box>
       </Box>
 
       {/* Summary Card */}

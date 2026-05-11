@@ -4,6 +4,7 @@ include sim2l/version.py
 
 # Include schema files
 recursive-include sim2l/repository *.sql
+recursive-include sim2l/database *.sql
 
 # Include tests
 recursive-include tests *.py

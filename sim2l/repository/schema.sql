@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS simulations (
     input_schema TEXT NOT NULL,  -- JSON
     output_schema TEXT NOT NULL,  -- JSON
     workflow_type TEXT NOT NULL,  -- 'notebook', 'function', 'dag'
-    workflow_data BLOB NOT NULL,  -- Notebook bytes or pickled function
+    workflow_data BLOB NOT NULL,  -- Notebook bytes or function source bytes
     workflow_hash TEXT,
     dependencies TEXT,  -- JSON array
     status TEXT NOT NULL DEFAULT 'active',  -- 'active', 'deprecated', 'archived'

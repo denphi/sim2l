@@ -7,10 +7,12 @@
 from typing import Optional, Callable, Union, List
 from pathlib import Path
 import hashlib
-import pickle
+import inspect
+import warnings
 
 from ..schema import InputSchema, OutputSchema
 from .metadata import SimulationMetadata
+from .function_workflow import function_to_source
 
 
 class SimulationDefinition:
@@ -86,34 +88,46 @@ class SimulationDefinition:
         return self.metadata.dependencies
 
     def _compute_workflow_hash(self) -> str:
-        """Compute hash of workflow for change detection"""
+        """Compute hash of workflow for change detection.
+
+        For callables, source code is used when available.  If source cannot
+        be retrieved (e.g. built-ins, lambdas, C extensions) the hash is left
+        empty and a warning is raised so callers can supply an explicit hash.
+        """
         if callable(self.workflow):
-            # Hash function source code
-            import inspect
+            source = getattr(self.workflow, "__sim2l_source__", None)
+            if source is not None:
+                return hashlib.sha256(source.encode()).hexdigest()[:16]
             try:
                 source = inspect.getsource(self.workflow)
                 return hashlib.sha256(source.encode()).hexdigest()[:16]
-            except Exception:
-                # If source not available, use pickled function
-                pickled = pickle.dumps(self.workflow)
-                return hashlib.sha256(pickled).hexdigest()[:16]
+            except (OSError, TypeError):
+                warnings.warn(
+                    f"Cannot determine source for workflow callable "
+                    f"'{getattr(self.workflow, '__name__', repr(self.workflow))}'. "
+                    "Cache keys will be non-deterministic. Pass an explicit "
+                    "workflow_hash= to SimulationDefinition to suppress this.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return ""
 
         elif isinstance(self.workflow, bytes):
-            # Hash notebook bytes
             return hashlib.sha256(self.workflow).hexdigest()[:16]
 
         elif isinstance(self.workflow, Path):
-            # Hash file contents
             with open(self.workflow, 'rb') as f:
                 return hashlib.sha256(f.read()).hexdigest()[:16]
 
         return ""
 
     def get_workflow_bytes(self) -> bytes:
-        """Get workflow as bytes for storage
+        """Get workflow as bytes for storage.
 
-        Returns:
-            Workflow as bytes
+        Callables are serialized via inspect.getsource() so the result is
+        deterministic and human-readable.  Falls back to a UTF-8 repr string
+        if source is unavailable (e.g. built-ins); raises ValueError for
+        types that cannot be serialized at all.
         """
         if isinstance(self.workflow, bytes):
             return self.workflow
@@ -123,8 +137,18 @@ class SimulationDefinition:
                 return f.read()
 
         elif callable(self.workflow):
-            # Pickle the function
-            return pickle.dumps(self.workflow)
+            source = getattr(self.workflow, "__sim2l_source__", None)
+            if source is not None:
+                return source.encode("utf-8")
+            try:
+                return function_to_source(self.workflow)
+            except (OSError, TypeError):
+                name = getattr(self.workflow, '__qualname__', repr(self.workflow))
+                module = getattr(self.workflow, '__module__', '')
+                raise ValueError(
+                    f"Cannot serialize function workflow source for {module}.{name}. "
+                    "Define the workflow in an importable .py file or pass source bytes."
+                )
 
         else:
             raise ValueError(f"Cannot convert workflow of type {type(self.workflow)} to bytes")

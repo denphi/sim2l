@@ -36,6 +36,11 @@ export class ResultsServiceClient {
     };
   }
 
+  async clearAllResults(): Promise<{ deleted: number }> {
+    const response = await apiClient.results.delete<{ deleted: number }>('/results');
+    return response.data;
+  }
+
   async getParameterStats(simulationName: string, paramName: string): Promise<ParameterStats> {
     const response = await apiClient.results.get<ParameterStats>(
       `/stats/${simulationName}/${paramName}`

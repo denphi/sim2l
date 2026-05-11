@@ -10,6 +10,7 @@ export interface Simulation {
   tags?: string[];
   status: 'active' | 'deprecated' | 'archived';
   input_schema?: Record<string, any>;
+  output_schema?: Record<string, any>;
   created_at: string;
   updated_at: string;
 }

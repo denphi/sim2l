@@ -69,6 +69,7 @@ setup(
     entry_points={
         "console_scripts": [
             "sim2l=sim2l.cli.main:cli",
+            "sim2l-services=sim2l.cli.services:services",
         ],
     },
     classifiers=[
@@ -90,6 +91,6 @@ setup(
     keywords="simulation, jupyter, notebook, database, scientific-computing, workflow",
     include_package_data=True,
     package_data={
-        "sim2l": ["repository/schema.sql"],
+        "sim2l": ["repository/*.sql", "database/*.sql"],
     },
 )

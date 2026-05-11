@@ -20,6 +20,8 @@ import {
   Card,
   CardContent,
   Collapse,
+  Divider,
+  LinearProgress,
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -29,10 +31,15 @@ import {
   Delete as DeleteIcon,
   KeyboardArrowDown as KeyboardArrowDownIcon,
   KeyboardArrowUp as KeyboardArrowUpIcon,
+  Input as InputIcon,
+  Output as OutputIcon,
+  BarChart as BarChartIcon,
+  Code as CodeIcon,
+  ContentCopy as ContentCopyIcon,
 } from '@mui/icons-material';
 import { catalogService } from '../api/catalogService';
 import { SubmitRunModal } from '../components/catalog/SubmitRunModal';
-import type { Simulation, OverviewStats } from '../types/catalog';
+import type { Simulation, OverviewStats, ExecutionStats } from '../types/catalog';
 
 export function Catalog() {
   const [simulations, setSimulations] = useState<Simulation[]>([]);
@@ -45,6 +52,10 @@ export function Catalog() {
   const [selectedSimVersion, setSelectedSimVersion] = useState<string | undefined>(undefined);
   const [deletingSimulationId, setDeletingSimulationId] = useState<number | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  // Cache full simulation details (with input/output schema) fetched on expand
+  const [simDetails, setSimDetails] = useState<Record<string, Simulation>>({});
+  const [simExecStats, setSimExecStats] = useState<Record<string, ExecutionStats>>({});
+  const [loadingDetails, setLoadingDetails] = useState<Set<string>>(new Set());
 
   const handleOpenRunModal = (name: string, version: string) => {
     setSelectedSimName(name);
@@ -52,7 +63,7 @@ export function Catalog() {
     setRunModalOpen(true);
   };
 
-  const handleToggleRow = (simKey: string) => {
+  const handleToggleRow = async (simKey: string, sim: Simulation) => {
     setExpandedRows(prev => {
       const newSet = new Set(prev);
       if (newSet.has(simKey)) {
@@ -62,6 +73,27 @@ export function Catalog() {
       }
       return newSet;
     });
+
+    // Fetch full details + stats when expanding for the first time
+    if (!simDetails[simKey]) {
+      setLoadingDetails(prev => new Set(prev).add(simKey));
+      try {
+        const [detail, execStats] = await Promise.allSettled([
+          catalogService.getSimulation(sim.name, sim.version),
+          catalogService.getExecutionStats(sim.id),
+        ]);
+        if (detail.status === 'fulfilled') {
+          setSimDetails(prev => ({ ...prev, [simKey]: detail.value }));
+        }
+        if (execStats.status === 'fulfilled') {
+          setSimExecStats(prev => ({ ...prev, [simKey]: execStats.value }));
+        }
+      } catch (_) {
+        // non-fatal
+      } finally {
+        setLoadingDetails(prev => { const s = new Set(prev); s.delete(simKey); return s; });
+      }
+    }
   };
 
   useEffect(() => {
@@ -93,6 +125,21 @@ export function Catalog() {
 
   const handleSearch = () => {
     loadData();
+  };
+
+  const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      `Delete ALL simulations from the catalog? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      const result = await catalogService.clearAllSimulations();
+      window.alert(`Cleared ${result.deleted} simulation(s).`);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to clear catalog:', error);
+      window.alert('Failed to clear catalog. See browser console for details.');
+    }
   };
 
   const handleDeleteSimulation = async (sim: Simulation) => {
@@ -151,11 +198,21 @@ export function Catalog() {
     <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
         <Typography variant="h4">Catalog Service</Typography>
-        <Tooltip title="Refresh">
-          <IconButton onClick={loadData} color="primary">
-            <RefreshIcon />
-          </IconButton>
-        </Tooltip>
+        <Box display="flex" gap={1} alignItems="center">
+          <Button
+            variant="outlined"
+            color="error"
+            size="small"
+            onClick={handleClearAll}
+          >
+            Clear All
+          </Button>
+          <Tooltip title="Refresh">
+            <IconButton onClick={loadData} color="primary">
+              <RefreshIcon />
+            </IconButton>
+          </Tooltip>
+        </Box>
       </Box>
 
       {/* Statistics Cards */}
@@ -270,7 +327,7 @@ export function Catalog() {
                           <TableCell>
                             <IconButton
                               size="small"
-                              onClick={() => handleToggleRow(simKey)}
+                              onClick={() => handleToggleRow(simKey, sim)}
                             >
                               {isExpanded ? <KeyboardArrowUpIcon /> : <KeyboardArrowDownIcon />}
                             </IconButton>
@@ -339,65 +396,208 @@ export function Catalog() {
                           <TableCell style={{ paddingBottom: 0, paddingTop: 0 }} colSpan={9}>
                             <Collapse in={isExpanded} timeout="auto" unmountOnExit>
                               <Box sx={{ margin: 2 }}>
-                                <Typography variant="h6" gutterBottom component="div">
-                                  Parameters
-                                </Typography>
-                                {sim.input_schema && Object.keys(sim.input_schema).length > 0 ? (
-                                  <Table size="small" aria-label="parameters">
-                                    <TableHead>
-                                      <TableRow>
-                                        <TableCell><strong>Parameter</strong></TableCell>
-                                        <TableCell><strong>Type</strong></TableCell>
-                                        <TableCell><strong>Description</strong></TableCell>
-                                        <TableCell><strong>Default</strong></TableCell>
-                                      </TableRow>
-                                    </TableHead>
-                                    <TableBody>
-                                      {Object.entries(sim.input_schema).map(([key, schemaDef]: [string, any]) => (
-                                        <TableRow key={key}>
-                                          <TableCell component="th" scope="row">
-                                            <Typography variant="body2" fontWeight="medium">
-                                              {schemaDef.label || key}
+                                {loadingDetails.has(simKey) ? (
+                                  <LinearProgress sx={{ my: 2 }} />
+                                ) : (() => {
+                                  const detail = simDetails[simKey] || sim;
+                                  const execStats = simExecStats[simKey];
+                                  const inputSchema = detail.input_schema || sim.input_schema;
+                                  const outputSchema = (detail as any).output_schema;
+
+                                  return (
+                                    <Grid container spacing={3}>
+                                      {/* Input Parameters */}
+                                      <Grid item xs={12} md={6}>
+                                        <Box display="flex" alignItems="center" gap={1} mb={1}>
+                                          <InputIcon fontSize="small" color="primary" />
+                                          <Typography variant="subtitle1" fontWeight="bold">
+                                            Input Parameters
+                                          </Typography>
+                                        </Box>
+                                        {inputSchema && Object.keys(inputSchema).length > 0 ? (
+                                          <Table size="small">
+                                            <TableHead>
+                                              <TableRow>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Name</TableCell>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Type</TableCell>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Default</TableCell>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Description</TableCell>
+                                              </TableRow>
+                                            </TableHead>
+                                            <TableBody>
+                                              {Object.entries(inputSchema).map(([key, def]: [string, any]) => (
+                                                <TableRow key={key}>
+                                                  <TableCell>
+                                                    <Typography variant="body2" fontFamily="monospace" fontWeight="medium">
+                                                      {key}
+                                                    </Typography>
+                                                  </TableCell>
+                                                  <TableCell>
+                                                    <Chip label={def?.type || 'Number'} size="small" color="primary" variant="outlined" />
+                                                  </TableCell>
+                                                  <TableCell>
+                                                    <Typography variant="body2">
+                                                      {def?.default !== undefined ? String(def.default) : '—'}
+                                                    </Typography>
+                                                  </TableCell>
+                                                  <TableCell>
+                                                    <Typography variant="body2" color="textSecondary">
+                                                      {def?.description || key}
+                                                    </Typography>
+                                                  </TableCell>
+                                                </TableRow>
+                                              ))}
+                                            </TableBody>
+                                          </Table>
+                                        ) : (
+                                          <Typography variant="body2" color="textSecondary" sx={{ ml: 1 }}>
+                                            No input parameters defined.
+                                          </Typography>
+                                        )}
+                                      </Grid>
+
+                                      {/* Output Schema */}
+                                      <Grid item xs={12} md={6}>
+                                        <Box display="flex" alignItems="center" gap={1} mb={1}>
+                                          <OutputIcon fontSize="small" color="secondary" />
+                                          <Typography variant="subtitle1" fontWeight="bold">
+                                            Outputs
+                                          </Typography>
+                                        </Box>
+                                        {outputSchema && Object.keys(outputSchema).length > 0 ? (
+                                          <Table size="small">
+                                            <TableHead>
+                                              <TableRow>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Name</TableCell>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Type</TableCell>
+                                                <TableCell sx={{ fontWeight: 'bold' }}>Description</TableCell>
+                                              </TableRow>
+                                            </TableHead>
+                                            <TableBody>
+                                              {Object.entries(outputSchema).map(([key, def]: [string, any]) => (
+                                                <TableRow key={key}>
+                                                  <TableCell>
+                                                    <Typography variant="body2" fontFamily="monospace" fontWeight="medium">
+                                                      {key}
+                                                    </Typography>
+                                                  </TableCell>
+                                                  <TableCell>
+                                                    <Chip label={def?.type || 'Number'} size="small" color="secondary" variant="outlined" />
+                                                  </TableCell>
+                                                  <TableCell>
+                                                    <Typography variant="body2" color="textSecondary">
+                                                      {def?.description || key}
+                                                    </Typography>
+                                                  </TableCell>
+                                                </TableRow>
+                                              ))}
+                                            </TableBody>
+                                          </Table>
+                                        ) : (
+                                          <Typography variant="body2" color="textSecondary" sx={{ ml: 1 }}>
+                                            No output schema defined.
+                                          </Typography>
+                                        )}
+                                      </Grid>
+
+                                      {/* Execution Stats */}
+                                      {execStats && (
+                                        <Grid item xs={12}>
+                                          <Divider sx={{ mb: 2 }} />
+                                          <Box display="flex" alignItems="center" gap={1} mb={1}>
+                                            <BarChartIcon fontSize="small" color="action" />
+                                            <Typography variant="subtitle1" fontWeight="bold">
+                                              Execution History
                                             </Typography>
-                                          </TableCell>
-                                          <TableCell>
-                                            <Chip 
-                                              label={schemaDef.type || 'string'} 
-                                              size="small" 
+                                          </Box>
+                                          <Grid container spacing={2}>
+                                            {[
+                                              { label: 'Total Runs', value: execStats.total_executions, color: 'text.primary' },
+                                              { label: 'Successful', value: execStats.successful, color: 'success.main' },
+                                              { label: 'Failed', value: execStats.failed, color: 'error.main' },
+                                              { label: 'Cached', value: execStats.cached, color: 'info.main' },
+                                              { label: 'Avg Duration', value: execStats.avg_duration != null ? `${execStats.avg_duration.toFixed(2)}s` : '—', color: 'text.secondary' },
+                                              { label: 'Min / Max', value: execStats.min_duration != null ? `${execStats.min_duration.toFixed(2)}s / ${execStats.max_duration.toFixed(2)}s` : '—', color: 'text.secondary' },
+                                            ].map(({ label, value, color }) => (
+                                              <Grid item xs={6} sm={4} md={2} key={label}>
+                                                <Paper variant="outlined" sx={{ p: 1.5, textAlign: 'center' }}>
+                                                  <Typography variant="caption" color="textSecondary" display="block">
+                                                    {label}
+                                                  </Typography>
+                                                  <Typography variant="h6" color={color} fontWeight="bold">
+                                                    {value}
+                                                  </Typography>
+                                                </Paper>
+                                              </Grid>
+                                            ))}
+                                          </Grid>
+                                        </Grid>
+                                      )}
+
+                                      {/* Tags */}
+                                      {detail.tags && detail.tags.length > 0 && (
+                                        <Grid item xs={12}>
+                                          <Box display="flex" gap={1} flexWrap="wrap" alignItems="center">
+                                            <Typography variant="caption" color="textSecondary">Tags:</Typography>
+                                            {detail.tags.map((tag, idx) => (
+                                              <Chip key={idx} label={tag} size="small" variant="outlined" />
+                                            ))}
+                                          </Box>
+                                        </Grid>
+                                      )}
+
+                                      {/* Workflow Source Code */}
+                                      {(() => {
+                                        const src = (detail as any).metadata?.workflow_source as string | undefined;
+                                        if (!src) return null;
+                                        return (
+                                          <Grid item xs={12}>
+                                            <Divider sx={{ mb: 2 }} />
+                                            <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+                                              <Box display="flex" alignItems="center" gap={1}>
+                                                <CodeIcon fontSize="small" color="action" />
+                                                <Typography variant="subtitle1" fontWeight="bold">
+                                                  Workflow Code
+                                                </Typography>
+                                                <Chip label="workflow.py" size="small" variant="outlined" />
+                                              </Box>
+                                              <Tooltip title="Copy code">
+                                                <IconButton
+                                                  size="small"
+                                                  onClick={() => navigator.clipboard.writeText(src)}
+                                                >
+                                                  <ContentCopyIcon fontSize="small" />
+                                                </IconButton>
+                                              </Tooltip>
+                                            </Box>
+                                            <Paper
                                               variant="outlined"
-                                            />
-                                          </TableCell>
-                                          <TableCell>
-                                            <Typography variant="body2" color="textSecondary">
-                                              {schemaDef.description || 'N/A'}
-                                            </Typography>
-                                          </TableCell>
-                                          <TableCell>
-                                            <Typography variant="body2">
-                                              {schemaDef.default !== undefined ? String(schemaDef.default) : 'N/A'}
-                                            </Typography>
-                                          </TableCell>
-                                        </TableRow>
-                                      ))}
-                                    </TableBody>
-                                  </Table>
-                                ) : (
-                                  <Typography variant="body2" color="textSecondary">
-                                    No parameters defined for this simulation.
-                                  </Typography>
-                                )}
-                                {sim.tags && sim.tags.length > 0 && (
-                                  <Box sx={{ mt: 2 }}>
-                                    <Typography variant="subtitle2" gutterBottom>
-                                      Tags:
-                                    </Typography>
-                                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                                      {sim.tags.map((tag, idx) => (
-                                        <Chip key={idx} label={tag} size="small" />
-                                      ))}
-                                    </Box>
-                                  </Box>
-                                )}
+                                              sx={{
+                                                p: 2,
+                                                backgroundColor: '#1e1e1e',
+                                                overflow: 'auto',
+                                                maxHeight: 400,
+                                              }}
+                                            >
+                                              <Typography
+                                                component="pre"
+                                                sx={{
+                                                  fontFamily: 'monospace',
+                                                  fontSize: '0.8rem',
+                                                  color: '#d4d4d4',
+                                                  margin: 0,
+                                                  whiteSpace: 'pre',
+                                                }}
+                                              >
+                                                {src}
+                                              </Typography>
+                                            </Paper>
+                                          </Grid>
+                                        );
+                                      })()}
+                                    </Grid>
+                                  );
+                                })()}
                               </Box>
                             </Collapse>
                           </TableCell>

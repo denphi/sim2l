@@ -105,6 +105,44 @@ class ResultsClient:
             logger.error(f"Failed to register result: {e}")
             raise
 
+    def register_direct(
+        self,
+        execution_id: str,
+        simulation_name: str,
+        simulation_version: str,
+        input_params: Dict[str, Any],
+        output_params: Dict[str, Any],
+        status: str,
+        squid_id: Optional[str] = None,
+        duration_seconds: Optional[float] = None,
+        run_db_path: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Register a result directly without introspecting a local run DB."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/register_direct",
+                json={
+                    "execution_id": execution_id,
+                    "simulation_name": simulation_name,
+                    "simulation_version": simulation_version,
+                    "squid_id": squid_id,
+                    "input_params": input_params,
+                    "output_params": output_params,
+                    "status": status,
+                    "duration_seconds": duration_seconds,
+                    "run_db_path": run_db_path,
+                    "metadata": metadata,
+                },
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            logger.error(f"Failed to register direct result: {e}")
+            raise
+
     def search(
         self,
         simulation_name: Optional[str] = None,

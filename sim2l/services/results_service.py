@@ -153,7 +153,7 @@ class SQLiteResultsBackend(ResultsBackend):
                 simulation_name TEXT NOT NULL,
                 simulation_version TEXT NOT NULL,
                 schema_id INTEGER REFERENCES simulation_schemas(id),
-                squid_id TEXT,
+                squid_id TEXT UNIQUE,
                 input_params TEXT NOT NULL,
                 output_params TEXT,
                 status TEXT DEFAULT 'pending',
@@ -204,8 +204,32 @@ class SQLiteResultsBackend(ResultsBackend):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_exec_id ON execution_results(execution_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_simulation ON execution_results(simulation_name, simulation_version)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_squid ON execution_results(squid_id)")
+        self._ensure_sqlite_result_constraints(cursor)
 
         conn.commit()
+
+    def _ensure_sqlite_result_constraints(self, cursor):
+        """Apply result-table constraints required by SQLite upsert paths."""
+        cursor.execute("UPDATE execution_results SET squid_id = NULL WHERE squid_id = ''")
+        cursor.execute("""
+            UPDATE execution_results
+            SET squid_id = NULL
+            WHERE squid_id IS NOT NULL
+              AND id NOT IN (
+                  SELECT MAX(id)
+                  FROM execution_results
+                  WHERE squid_id IS NOT NULL
+                  GROUP BY squid_id
+              )
+        """)
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_results_execution_id
+            ON execution_results(execution_id)
+        """)
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_exec_results_squid
+            ON execution_results(squid_id)
+        """)
 
     def register_schema(
         self,
@@ -265,20 +289,22 @@ class SQLiteResultsBackend(ResultsBackend):
         input_json = json.dumps(input_params)
         output_json = json.dumps(output_params) if output_params else None
         metadata_json = json.dumps(metadata) if metadata else None
+        normalized_squid_id = squid_id or None
+        conflict_key = "squid_id" if normalized_squid_id is not None else "execution_id"
 
-        cursor.execute("""
+        cursor.execute(f"""
             INSERT INTO execution_results (
                 execution_id, simulation_name, simulation_version, schema_id,
                 squid_id, input_params, output_params, status, duration_seconds,
                 run_db_path, metadata, completed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(execution_id) DO UPDATE SET
+            ON CONFLICT({conflict_key}) DO UPDATE SET
                 output_params = excluded.output_params,
                 status = excluded.status,
                 duration_seconds = excluded.duration_seconds,
                 completed_at = CURRENT_TIMESTAMP
         """, (execution_id, simulation_name, simulation_version, schema_id,
-              squid_id, input_json, output_json, status, duration_seconds,
+              normalized_squid_id, input_json, output_json, status, duration_seconds,
               run_db_path, metadata_json))
 
         conn.commit()
@@ -566,12 +592,13 @@ class PostgreSQLResultsBackend(ResultsBackend):
         import json
         conn = self._get_conn()
         cursor = conn.cursor()
+        normalized_squid_id = squid_id or None
 
         cursor.execute("""
             SELECT register_execution_result(
                 %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb
             )
-        """, (execution_id, simulation_name, simulation_version, squid_id,
+        """, (execution_id, simulation_name, simulation_version, normalized_squid_id,
               json.dumps(input_params), json.dumps(output_params),
               status, duration_seconds, run_db_path,
               json.dumps(metadata) if metadata else None))
@@ -898,7 +925,7 @@ def create_results_service(
 
         # Validate required fields
         required_fields = ['execution_id', 'simulation_name', 'simulation_version',
-                          'squid_id', 'input_params', 'output_params', 'status']
+                          'input_params', 'output_params', 'status']
         for field in required_fields:
             if field not in data:
                 logger.warning(f"Missing required field: {field}")
@@ -954,7 +981,7 @@ def create_results_service(
                 execution_id=data['execution_id'],
                 simulation_name=data['simulation_name'],
                 simulation_version=data['simulation_version'],
-                squid_id=data['squid_id'],
+                squid_id=data.get('squid_id') or None,
                 input_params=data['input_params'],
                 output_params=data['output_params'],
                 status=data['status'],
@@ -1042,6 +1069,27 @@ def create_results_service(
 
         result, status = results_backend.delete_result(execution_id)
         return jsonify(result), status
+
+    @app.route('/results', methods=['DELETE'])
+    def clear_all_results():
+        """Delete all results."""
+        auth_result = check_session()
+        if isinstance(auth_result, tuple):
+            return auth_result
+
+        try:
+            all_results = results_backend.search_results(
+                simulation_name=None, input_filters={}, output_filters={}, limit=100000
+            )
+            deleted = 0
+            for r in all_results:
+                _, status = results_backend.delete_result(r["execution_id"])
+                if status == 200:
+                    deleted += 1
+            return jsonify({"deleted": deleted}), 200
+        except Exception as exc:
+            app.logger.error(f"Clear all results failed: {exc}")
+            return jsonify({"error": "Internal server error"}), 500
 
     @app.route('/stats/<simulation_name>/<param_name>', methods=['GET'])
     def get_parameter_stats(simulation_name, param_name):

@@ -50,6 +50,11 @@ export class CatalogServiceClient {
     };
   }
 
+  async clearAllSimulations(): Promise<{ deleted: number }> {
+    const response = await apiClient.catalog.delete<{ deleted: number }>('/simulations');
+    return response.data;
+  }
+
   async getExecutionStats(simulationId: number): Promise<ExecutionStats> {
     const response = await apiClient.catalog.get<ExecutionStats>(
       `/simulations/${simulationId}/stats`

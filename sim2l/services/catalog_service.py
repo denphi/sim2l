@@ -18,12 +18,24 @@ import json
 import base64
 import binascii
 import hashlib
+import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
+
+# Shared service helpers (see sim2l/services/_common.py).
+from sim2l.services._common import (
+    adapt_postgres_schema_for_sqlite as _adapt_postgres_schema_for_sqlite,
+    extract_session_id as _extract_session_id,
+    utcnow as _utcnow,
+)
 import sim2l
-from sim2l.executor import LocalExecutor, NotebookExecutor
+from sim2l.definition import SimulationDefinition
+from sim2l.schema import InputSchema, OutputSchema
+from sim2l.executor import IsolatedFunctionExecutor, LocalExecutor, NotebookExecutor
+from sim2l.database.results_client import ResultsClient
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -39,54 +51,27 @@ require_auth = True
 
 
 def _adapt_catalog_schema_for_sqlite(schema_sql: str) -> str:
-    """Convert a PostgreSQL catalog schema to SQLite-compatible SQL.
+    """Catalog-service-specific adapter for PostgreSQL → SQLite schema SQL.
 
-    Handles type substitutions and strips PostgreSQL-specific constructs
-    (functions, views, triggers) that SQLite doesn't support.
+    Delegates to the shared helper with catalog-specific options: also strip
+    triggers, rewrite the ``USING GIN(tags)`` index, and restore
+    ``IF NOT EXISTS`` on every CREATE TABLE.
     """
-    schema_sql = schema_sql.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-    schema_sql = schema_sql.replace("BIGSERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
-    schema_sql = schema_sql.replace("JSONB", "TEXT")
-    schema_sql = schema_sql.replace("BIGINT", "INTEGER")
-    schema_sql = schema_sql.replace("BOOLEAN", "INTEGER")
-    schema_sql = schema_sql.replace("DEFAULT true", "DEFAULT 1")
-    schema_sql = schema_sql.replace("DEFAULT false", "DEFAULT 0")
-    schema_sql = schema_sql.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
-
-    # Remove PostgreSQL-specific blocks using $$ delimiter tracking
-    lines = schema_sql.split("\n")
-    filtered_lines = []
-    skip_until_end = False
-    paren_depth = 0
-
-    for line in lines:
-        if any(x in line for x in [
+    return _adapt_postgres_schema_for_sqlite(
+        schema_sql,
+        pg_block_starters=(
             "CREATE OR REPLACE FUNCTION",
             "CREATE OR REPLACE VIEW",
             "CREATE TRIGGER",
-        ]):
-            skip_until_end = True
-            paren_depth = 0
-
-        if skip_until_end:
-            if "$$" in line:
-                if paren_depth == 0:
-                    paren_depth = 1
-                else:
-                    paren_depth = 0
-                    skip_until_end = False
-            elif line.rstrip().endswith(";") and paren_depth == 0:
-                skip_until_end = False
-            continue
-
-        stripped = line.strip()
-        if stripped and not skip_until_end:
-            filtered_lines.append(line)
-
-    schema_sql = "\n".join(filtered_lines)
-    # Restore IF NOT EXISTS for table creation
-    schema_sql = schema_sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
-    return schema_sql
+        ),
+        extra_regex_substitutions=(
+            (
+                r"CREATE INDEX IF NOT EXISTS idx_simulations_tags ON simulations USING GIN\(tags\);",
+                "CREATE INDEX IF NOT EXISTS idx_simulations_tags ON simulations(tags);",
+            ),
+        ),
+        restore_if_not_exists_prefix="",  # restore on every CREATE TABLE
+    )
 
 
 def _default_workflow_entrypoint(workflow_type: Optional[str]) -> str:
@@ -285,6 +270,94 @@ def _resolve_input_output_schemas(payload: dict, workflow_bundle: Optional[dict]
     return input_schema, output_schema
 
 
+def _file_content_from_bundle(workflow_bundle: dict, entrypoint: str) -> bytes:
+    for file_data in workflow_bundle.get("files", []):
+        if file_data.get("path") != entrypoint:
+            continue
+        if file_data.get("encoding") == "base64":
+            return base64.b64decode(file_data.get("content_base64", ""))
+        content = file_data.get("content")
+        if content is not None:
+            return str(content).encode("utf-8")
+    raise ValueError(f"Workflow entrypoint '{entrypoint}' not found in workflow_bundle")
+
+
+def _workflow_hash_from_bundle(workflow_bundle: Optional[dict]) -> Optional[str]:
+    if not workflow_bundle:
+        return None
+    digest = hashlib.sha256()
+    for file_data in sorted(workflow_bundle.get("files", []), key=lambda item: item.get("path", "")):
+        digest.update(str(file_data.get("path", "")).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_file_content_from_bundle(workflow_bundle, file_data.get("path", "")))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _simulation_from_catalog_record(record: dict) -> SimulationDefinition:
+    workflow_bundle = record.get("workflow_bundle")
+    if not workflow_bundle:
+        raise ValueError(
+            "Simulation has no workflow_bundle; deploy it locally or re-register with workflow files"
+        )
+
+    workflow_type = (workflow_bundle.get("workflow_type") or record.get("workflow_type") or "notebook").lower()
+    entrypoint = workflow_bundle.get("entrypoint") or _default_workflow_entrypoint(workflow_type)
+    workflow_bytes = _file_content_from_bundle(workflow_bundle, entrypoint)
+
+    if workflow_type in {"function", "python"}:
+        workflow = workflow_bytes
+        workflow_type = "function"
+    elif workflow_type == "notebook":
+        tmp = tempfile.NamedTemporaryFile(prefix="sim2l_catalog_", suffix=".ipynb", delete=False)
+        try:
+            tmp.write(workflow_bytes)
+            tmp.close()
+            workflow = Path(tmp.name)
+        except Exception:
+            tmp.close()
+            raise
+    else:
+        raise ValueError(f"Unsupported catalog workflow_type for /run: {workflow_type}")
+
+    return SimulationDefinition(
+        name=record["name"],
+        version=record["version"],
+        inputs=InputSchema.from_dict(record.get("input_schema") or {}),
+        outputs=OutputSchema.from_dict(record.get("output_schema") or {}),
+        workflow=workflow,
+        description=record.get("description") or "",
+        author=record.get("author") or "",
+        tags=record.get("tags") or [],
+        dependencies=record.get("dependencies") or [],
+        workflow_type=workflow_type,
+    )
+
+
+def _register_service_result(result, params: dict, outputs: dict, session_id: Optional[str]) -> None:
+    """Mirror a catalog-service run to the configured results service."""
+    config = sim2l.get_config()
+    if not config.results_service_url:
+        return
+
+    client = ResultsClient(
+        config.results_service_url,
+        session_id=config.results_session_id or session_id,
+    )
+    client.register_direct(
+        execution_id=result.execution_id,
+        simulation_name=result.simulation_name,
+        simulation_version=result.simulation_version,
+        squid_id=result.squid_id,
+        input_params=params,
+        output_params=outputs if isinstance(outputs, dict) else {},
+        status=result.status,
+        duration_seconds=result.duration_seconds,
+        run_db_path="",
+        metadata={"source": "catalog_service.run"},
+    )
+
+
 class CatalogServiceBackend:
     """Abstract backend for catalog service."""
 
@@ -318,6 +391,12 @@ class CatalogServiceBackend:
     def get_overview_stats(self):
         raise NotImplementedError
 
+    def can_run_simulation(self, session_id: str):
+        raise NotImplementedError
+
+    def refresh_session(self, session_id: str):
+        raise NotImplementedError
+
     def health_check(self):
         raise NotImplementedError
 
@@ -329,10 +408,15 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
     Flask requests each get their own SQLite connection, avoiding
     'OperationalError: database is locked' errors under load.
     WAL journal mode is enabled for better read concurrency.
+
+    The ``no_auth`` flag is set once at startup. When True (and only when
+    True), session_id "no-auth-session" auto-grants all privileges. This is
+    a *server*-side flag — it cannot be triggered by anything a client sends.
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, no_auth: bool = False):
         self.db_path = db_path
+        self.no_auth = no_auth
         self._local = threading.local()
         self._schema_lock = threading.Lock()
         self._create_schema()
@@ -395,12 +479,15 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         return cursor.fetchone() is not None
 
     def _check_privilege(self, session_id: str, privilege: str) -> bool:
-        """Check if session has privilege."""
-        # Allow no-auth-session to have all privileges
-        if session_id == "no-auth-session":
+        """Check if session has privilege.
+
+        Only honors the "no-auth-session" sentinel when the backend was
+        constructed with ``no_auth=True``. In production (auth enabled) the
+        sentinel is ignored — even if a client sends it as ``X-Session-ID``.
+        """
+        if self.no_auth and session_id == "no-auth-session":
             return True
 
-        import json
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
@@ -418,6 +505,14 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
 
         privileges = json.loads(row["privileges"]) if row["privileges"] else []
         return privilege in privileges or "admin" in privileges
+
+    def can_run_simulation(self, session_id: str):
+        if not self._check_session(session_id):
+            return {"error": "Invalid or expired session"}, 401
+        for privilege in ("execute", "run"):
+            if self._check_privilege(session_id, privilege):
+                return {"allowed": True}, 200
+        return {"error": "Insufficient privileges"}, 403
 
     def search(self, query, tags, status, limit):
         import json
@@ -440,7 +535,7 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         cursor.execute(
             f"""
             SELECT id, name, version, description, author, tags, status,
-                   created_at, updated_at
+                   created_at, updated_at, input_schema, output_schema
             FROM simulations
             WHERE {where_clause}
             ORDER BY created_at DESC
@@ -453,6 +548,8 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         for row in cursor.fetchall():
             sim = dict(row)
             sim["tags"] = json.loads(sim["tags"]) if sim["tags"] else []
+            sim["input_schema"] = json.loads(sim["input_schema"]) if sim.get("input_schema") else {}
+            sim["output_schema"] = json.loads(sim["output_schema"]) if sim.get("output_schema") else {}
 
             # Filter by tags if specified
             if tags:
@@ -524,7 +621,7 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        if session_id == "no-auth-session":
+        if self.no_auth and session_id == "no-auth-session":
             user_id = None
         else:
             cursor.execute(
@@ -533,51 +630,58 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             user_row = cursor.fetchone()
             user_id = user_row["user_id"] if user_row else None
 
-        cursor.execute(
-            "SELECT id FROM simulations WHERE name = ? AND version = ?",
-            (data["name"], data["version"]),
-        )
-        if cursor.fetchone():
-            return {"error": "Simulation already registered"}, 409
+        # Use INSERT OR IGNORE inside an IMMEDIATE transaction so concurrent
+        # registers cannot both pass a pre-INSERT SELECT and then collide on
+        # the UNIQUE constraint with a 500. If the insert is ignored, the row
+        # already existed → return a clean 409.
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO simulations (
+                    name, version, description, author, author_email,
+                    organization, license, repository_url, documentation_url,
+                    tags, input_schema, output_schema, workflow_type,
+                    workflow_hash, workflow_bundle, dependencies, python_version, status,
+                    visibility, created_by, updated_by, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data["name"],
+                    data["version"],
+                    data.get("description"),
+                    data.get("author"),
+                    data.get("author_email"),
+                    data.get("organization"),
+                    data.get("license"),
+                    data.get("repository_url"),
+                    data.get("documentation_url"),
+                    json.dumps(data.get("tags", [])),
+                    json.dumps(input_schema),
+                    json.dumps(output_schema),
+                    data.get("workflow_type", "notebook"),
+                    data.get("workflow_hash") or _workflow_hash_from_bundle(workflow_bundle),
+                    json.dumps(workflow_bundle) if workflow_bundle is not None else None,
+                    json.dumps(data.get("dependencies", [])),
+                    data.get("python_version"),
+                    "active",
+                    data.get("visibility", "public"),
+                    user_id,
+                    user_id,
+                    json.dumps(data.get("metadata")),
+                ),
+            )
 
-        cursor.execute(
-            """
-            INSERT INTO simulations (
-                name, version, description, author, author_email,
-                organization, license, repository_url, documentation_url,
-                tags, input_schema, output_schema, workflow_type,
-                workflow_hash, workflow_bundle, dependencies, python_version, status,
-                visibility, created_by, updated_by, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data["name"],
-                data["version"],
-                data.get("description"),
-                data.get("author"),
-                data.get("author_email"),
-                data.get("organization"),
-                data.get("license"),
-                data.get("repository_url"),
-                data.get("documentation_url"),
-                json.dumps(data.get("tags", [])),
-                json.dumps(input_schema),
-                json.dumps(output_schema),
-                data.get("workflow_type", "notebook"),
-                data.get("workflow_hash"),
-                json.dumps(workflow_bundle) if workflow_bundle is not None else None,
-                json.dumps(data.get("dependencies", [])),
-                data.get("python_version"),
-                "active",
-                data.get("visibility", "public"),
-                user_id,
-                user_id,
-                json.dumps(data.get("metadata")),
-            ),
-        )
+            if cursor.rowcount == 0:
+                # Row was ignored → another transaction already inserted it.
+                conn.commit()
+                return {"error": "Simulation already registered"}, 409
 
-        simulation_id = cursor.lastrowid
-        conn.commit()
+            simulation_id = cursor.lastrowid
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         logger.info(f"Registered simulation {data['name']}/{data['version']} (ID: {simulation_id})")
         return {"id": simulation_id, "status": "registered"}, 201
@@ -865,6 +969,30 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
                 "cached_executions": 0,
             }, 200
 
+    def refresh_session(self, session_id: str):
+        """Extend session TTL by 24 hours."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET expires_at = datetime(expires_at, '+24 hours')
+            WHERE session_id = ?
+              AND is_valid = 1
+              AND expires_at > datetime('now')
+            """,
+            (session_id,),
+        )
+        if cursor.rowcount == 0:
+            conn.commit()
+            return {"error": "Session not found or already expired"}, 404
+        conn.commit()
+        cursor.execute(
+            "SELECT expires_at FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        row = cursor.fetchone()
+        return {"session_id": session_id, "expires_at": row[0] if row else None}, 200
+
     def health_check(self):
         try:
             conn = self._get_conn()
@@ -886,10 +1014,15 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
 
     Uses a per-thread connection pool (threading.local) for thread safety
     under concurrent Flask requests.
+
+    The ``no_auth`` flag is set once at startup. When True (and only when
+    True), session_id "no-auth-session" auto-grants all privileges. This is
+    a *server*-side flag — it cannot be triggered by anything a client sends.
     """
 
-    def __init__(self, connection_string: str):
+    def __init__(self, connection_string: str, no_auth: bool = False):
         self.connection_string = connection_string
+        self.no_auth = no_auth
         self._local = threading.local()
         self._create_schema()
 
@@ -959,8 +1092,13 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         return cursor.fetchone() is not None
 
     def _check_privilege(self, session_id: str, privilege: str) -> bool:
-        # Allow no-auth-session to have all privileges
-        if session_id == "no-auth-session":
+        """Check if session has privilege.
+
+        Only honors the "no-auth-session" sentinel when the backend was
+        constructed with ``no_auth=True``. In production (auth enabled) the
+        sentinel is ignored — even if a client sends it as ``X-Session-ID``.
+        """
+        if self.no_auth and session_id == "no-auth-session":
             return True
 
         conn = self._get_conn()
@@ -986,6 +1124,14 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
                 privileges = []
 
         return privilege in privileges or "admin" in privileges
+
+    def can_run_simulation(self, session_id: str):
+        if not self._check_session(session_id):
+            return {"error": "Invalid or expired session"}, 401
+        for privilege in ("execute", "run"):
+            if self._check_privilege(session_id, privilege):
+                return {"allowed": True}, 200
+        return {"error": "Insufficient privileges"}, 403
 
     def _normalize_json(self, value):
         if value is None:
@@ -1017,7 +1163,7 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         cursor.execute(
             f"""
             SELECT id, name, version, description, author, tags, status,
-                   created_at, updated_at
+                   created_at, updated_at, input_schema, output_schema
             FROM simulations
             WHERE {where_clause}
             ORDER BY created_at DESC
@@ -1030,6 +1176,8 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         for row in cursor.fetchall():
             sim = dict(row)
             sim["tags"] = self._normalize_json(sim.get("tags")) or []
+            sim["input_schema"] = self._normalize_json(sim.get("input_schema")) or {}
+            sim["output_schema"] = self._normalize_json(sim.get("output_schema")) or {}
 
             # Filter by tags if specified
             if tags:
@@ -1106,7 +1254,7 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         conn = self._get_conn()
         cursor = conn.cursor()
 
-        if session_id == "no-auth-session":
+        if self.no_auth and session_id == "no-auth-session":
             user_id = None
         else:
             cursor.execute(
@@ -1115,53 +1263,60 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             user_row = cursor.fetchone()
             user_id = user_row["user_id"] if user_row else None
 
-        cursor.execute(
-            "SELECT id FROM simulations WHERE name = %s AND version = %s",
-            (data["name"], data["version"]),
-        )
-        if cursor.fetchone():
-            return {"error": "Simulation already registered"}, 409
+        # Use ON CONFLICT DO NOTHING + RETURNING so concurrent inserts cannot
+        # both pass a pre-INSERT SELECT and then collide on the UNIQUE
+        # constraint with a 500. If RETURNING yields no row, the conflict
+        # fired → return a clean 409.
+        try:
+            cursor.execute(
+                """
+                INSERT INTO simulations (
+                    name, version, description, author, author_email,
+                    organization, license, repository_url, documentation_url,
+                    tags, input_schema, output_schema, workflow_type,
+                    workflow_hash, workflow_bundle, dependencies, python_version, status,
+                    visibility, created_by, updated_by, metadata
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
+                          %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (name, version) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    data["name"],
+                    data["version"],
+                    data.get("description"),
+                    data.get("author"),
+                    data.get("author_email"),
+                    data.get("organization"),
+                    data.get("license"),
+                    data.get("repository_url"),
+                    data.get("documentation_url"),
+                    json.dumps(data.get("tags", [])),
+                    json.dumps(input_schema),
+                    json.dumps(output_schema),
+                    data.get("workflow_type", "notebook"),
+                    data.get("workflow_hash") or _workflow_hash_from_bundle(workflow_bundle),
+                    json.dumps(workflow_bundle) if workflow_bundle is not None else None,
+                    json.dumps(data.get("dependencies", [])),
+                    data.get("python_version"),
+                    "active",
+                    data.get("visibility", "public"),
+                    user_id,
+                    user_id,
+                    json.dumps(data.get("metadata")),
+                ),
+            )
 
-        cursor.execute(
-            """
-            INSERT INTO simulations (
-                name, version, description, author, author_email,
-                organization, license, repository_url, documentation_url,
-                tags, input_schema, output_schema, workflow_type,
-                workflow_hash, workflow_bundle, dependencies, python_version, status,
-                visibility, created_by, updated_by, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                      %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb)
-            RETURNING id
-            """,
-            (
-                data["name"],
-                data["version"],
-                data.get("description"),
-                data.get("author"),
-                data.get("author_email"),
-                data.get("organization"),
-                data.get("license"),
-                data.get("repository_url"),
-                data.get("documentation_url"),
-                json.dumps(data.get("tags", [])),
-                json.dumps(input_schema),
-                json.dumps(output_schema),
-                data.get("workflow_type", "notebook"),
-                data.get("workflow_hash"),
-                json.dumps(workflow_bundle) if workflow_bundle is not None else None,
-                json.dumps(data.get("dependencies", [])),
-                data.get("python_version"),
-                "active",
-                data.get("visibility", "public"),
-                user_id,
-                user_id,
-                json.dumps(data.get("metadata")),
-            ),
-        )
+            row = cursor.fetchone()
+            if row is None:
+                conn.commit()
+                return {"error": "Simulation already registered"}, 409
 
-        simulation_id = cursor.fetchone()["id"]
-        conn.commit()
+            simulation_id = row["id"]
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         logger.info(f"Registered simulation {data['name']}/{data['version']} (ID: {simulation_id})")
         return {"id": simulation_id, "status": "registered"}, 201
@@ -1440,6 +1595,29 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
                 "cached_executions": 0,
             }, 200
 
+    def refresh_session(self, session_id: str):
+        """Extend session TTL by 24 hours."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sessions
+            SET expires_at = expires_at + INTERVAL '24 hours'
+            WHERE session_id = %s
+              AND is_valid = true
+              AND expires_at > CURRENT_TIMESTAMP
+            RETURNING expires_at
+            """,
+            (session_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            return {"error": "Session not found or already expired"}, 404
+        conn.commit()
+        expires_at = row.get("expires_at") if isinstance(row, dict) else row[0]
+        return {"session_id": session_id, "expires_at": str(expires_at)}, 200
+
     def health_check(self):
         try:
             conn = self._get_conn()
@@ -1462,6 +1640,17 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
 def health():
     data, status = catalog_db.health_check()
     return jsonify(data), status
+
+
+@app.route("/session/refresh", methods=["POST"])
+def refresh_session():
+    """Extend the expiry of the current session by the default TTL."""
+    session_id = request.headers.get("X-Session-ID")
+    if not session_id:
+        return jsonify({"error": "Missing session ID"}), 401
+
+    result, status_code = catalog_db.refresh_session(session_id)
+    return jsonify(result), status_code
 
 
 @app.route("/simulations/search", methods=["GET"])
@@ -1529,8 +1718,40 @@ def delete_simulation(simulation_id):
     return jsonify(result), status
 
 
+@app.route("/simulations", methods=["DELETE"])
+def clear_all_simulations():
+    session_id = request.headers.get("X-Session-ID")
+    if require_auth:
+        if not session_id:
+            return jsonify({"error": "Missing session ID"}), 401
+    else:
+        session_id = "no-auth-session"
+
+    try:
+        sims, search_status = catalog_db.search(query=None, tags=None, status="all", limit=10000)
+        if search_status != 200:
+            return jsonify({"error": "Could not list simulations"}), search_status
+        deleted = 0
+        for sim in sims:
+            _, status = catalog_db.delete_simulation(sim["id"], session_id)
+            if status == 200:
+                deleted += 1
+        return jsonify({"deleted": deleted}), 200
+    except Exception as exc:
+        logger.error(f"Clear all simulations failed: {exc}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/executions", methods=["POST"])
 def record_execution():
+    session_id = request.headers.get("X-Session-ID")
+    if require_auth and not session_id:
+        return jsonify({"error": "Missing session ID"}), 401
+    if require_auth:
+        auth_result, auth_status = catalog_db.can_run_simulation(session_id)
+        if auth_status != 200:
+            return jsonify(auth_result), auth_status
+
     data = request.json
     result, status = catalog_db.record_execution(data)
     return jsonify(result), status
@@ -1543,6 +1764,12 @@ def run_simulation():
     session_id = request.headers.get("X-Session-ID")
     if require_auth and not session_id:
         return jsonify({"error": "Missing session ID"}), 401
+    if require_auth:
+        auth_result, auth_status = catalog_db.can_run_simulation(session_id)
+        if auth_status != 200:
+            return jsonify(auth_result), auth_status
+    else:
+        session_id = "no-auth-session"
 
     data = request.json
     if not data:
@@ -1556,12 +1783,21 @@ def run_simulation():
         return jsonify({'error': 'simulation_name is required'}), 400
 
     try:
-        # Load the simulation
-        sim = sim2l.load_simulation(simulation_name, version=version)
+        # Load the simulation from the catalog first. This makes the service
+        # API authoritative for simulations registered through /simulations.
+        sim_record, sim_status = catalog_db.get_simulation(simulation_name, version)
+        if sim_status == 200 and sim_record:
+            sim = _simulation_from_catalog_record(sim_record)
+        else:
+            sim = sim2l.load_simulation(simulation_name, version=version)
         
-        # Use appropriate executor based on workflow type
+        # Use appropriate executor based on workflow type. Catalog function
+        # bundles are source-backed and run in a child process so submitted
+        # source never executes in the Flask worker process.
         if getattr(sim, 'workflow_type', 'python') == 'notebook':
             executor = NotebookExecutor(cache=True)
+        elif getattr(sim, 'workflow_type', 'python') == 'function' and sim_status == 200:
+            executor = IsolatedFunctionExecutor(cache=True, save_result=False)
         else:
             executor = LocalExecutor(cache=True)
         
@@ -1572,25 +1808,43 @@ def run_simulation():
         elapsed_time = time.time() - start_time
         
         # Format the output to return
-        outputs = result.outputs.dict() if hasattr(result.outputs, 'dict') else result.outputs
+        outputs = result.outputs.to_dict() if hasattr(result.outputs, 'to_dict') else result.outputs
+        if hasattr(outputs, 'dict'):
+            outputs = outputs.dict()
         if hasattr(outputs, '__dict__'):
             outputs = vars(outputs)
-            
-        def make_serializable(obj):
-            import numpy as np
-            if isinstance(obj, dict):
-                return {k: make_serializable(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [make_serializable(v) for v in obj]
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, (np.floating, np.float32, np.float64)):
-                return float(obj)
-            elif isinstance(obj, (np.integer, np.int32, np.int64)):
-                return int(obj)
-            return obj
 
-        outputs = make_serializable(outputs)
+        # Use the shared serialization helper instead of an ad-hoc local
+        # `make_serializable` copy — it already handles dicts/lists/np
+        # arrays/np scalars/Pint quantities and stays in sync with the rest
+        # of the codebase.
+        from sim2l.utils.serialization import serialize_for_hashing
+        outputs = serialize_for_hashing(outputs)
+
+        if sim_status == 200 and sim_record and sim_record.get("id"):
+            catalog_db.record_execution({
+                "execution_id": result.execution_id,
+                "squid_id": result.squid_id or result.execution_id,
+                "simulation_id": sim_record["id"],
+                "user_id": None,
+                "started_at": datetime.fromtimestamp(start_time, tz=timezone.utc).replace(tzinfo=None).isoformat(),
+                "completed_at": _utcnow().isoformat(),
+                "duration_seconds": result.duration_seconds or elapsed_time,
+                "status": result.status,
+                "executor_type": result.executor_type,
+                "cache_hit": False,
+                "run_db_path": None,
+                "run_db_size_bytes": None,
+                "input_hash": hashlib.sha256(
+                    json.dumps(params, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest(),
+                "output_count": len(outputs) if isinstance(outputs, dict) else 0,
+                "artifact_count": 0,
+                "error_count": 1 if result.status != "completed" else 0,
+                "warning_count": 0,
+                "environment": {"source": "catalog_service.run"},
+            })
+        _register_service_result(result, params, outputs, session_id)
             
         return jsonify({
             'success': True,
@@ -1686,13 +1940,13 @@ def main():
         logger.warning("Authentication DISABLED - for development/testing only!")
 
     if args.backend == "sqlite":
-        catalog_db = SQLiteCatalogBackend(args.db_path)
+        catalog_db = SQLiteCatalogBackend(args.db_path, no_auth=not require_auth)
         logger.info(f"Using SQLite backend: {args.db_path}")
     elif args.backend == "postgresql":
         if not args.db_url:
             logger.error("PostgreSQL backend requires --db-url")
             sys.exit(1)
-        catalog_db = PostgreSQLCatalogBackend(args.db_url)
+        catalog_db = PostgreSQLCatalogBackend(args.db_url, no_auth=not require_auth)
         logger.info("Using PostgreSQL backend")
 
     logger.info(f"Starting catalog service on {args.host}:{args.port}")

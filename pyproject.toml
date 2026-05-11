@@ -70,15 +70,18 @@ Repository = "https://github.com/denphi/sim2l"
 
 [project.scripts]
 sim2l = "sim2l.cli.main:cli"
+sim2l-services = "sim2l.cli.services:services"
 
 [tool.setuptools]
-packages = ["sim2l"]
+
+[tool.setuptools.packages.find]
+include = ["sim2l*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "sim2l.version.__version__"}
 
 [tool.setuptools.package-data]
-sim2l = ["repository/*.sql"]
+sim2l = ["repository/*.sql", "database/*.sql"]
 
 [tool.black]
 line-length = 88

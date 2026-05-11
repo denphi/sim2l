@@ -310,6 +310,9 @@ class CatalogClient:
                     f"Simulation {name}/{version} registration pending approval"
                 )
                 return True
+            elif response.status_code == 409:
+                logger.debug(f"Simulation {name}/{version} already registered — skipping")
+                return False  # caller can PATCH metadata if needed
             elif response.status_code == 401:
                 logger.error("Unauthorized: Invalid or expired session")
                 return False

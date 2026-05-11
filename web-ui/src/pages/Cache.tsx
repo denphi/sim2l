@@ -18,6 +18,7 @@ import {
   CardContent,
   CircularProgress,
   IconButton,
+  Button,
   Tooltip,
   Collapse,
 } from '@mui/material';
@@ -83,6 +84,21 @@ export function Cache() {
   const handleSearch = () => {
     setPage(0);
     loadData();
+  };
+
+  const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      `Delete ALL cache entries? This cannot be undone.`
+    );
+    if (!confirmed) return;
+    try {
+      const result = await cacheService.clearAllEntries();
+      window.alert(`Cleared ${result.deleted} cache entry(ies).`);
+      await loadData();
+    } catch (error) {
+      console.error('Failed to clear cache:', error);
+      window.alert('Failed to clear cache. See browser console for details.');
+    }
   };
 
   const handleDeleteEntry = async (entry: CacheEntry) => {
@@ -154,11 +170,21 @@ export function Cache() {
     <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
       <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
         <Typography variant="h4">Cache Service</Typography>
-        <Tooltip title="Refresh">
-          <IconButton onClick={loadData} color="primary">
-            <RefreshIcon />
-          </IconButton>
-        </Tooltip>
+        <Box display="flex" gap={1} alignItems="center">
+          <Button
+            variant="outlined"
+            color="error"
+            size="small"
+            onClick={handleClearAll}
+          >
+            Clear All
+          </Button>
+          <Tooltip title="Refresh">
+            <IconButton onClick={loadData} color="primary">
+              <RefreshIcon />
+            </IconButton>
+          </Tooltip>
+        </Box>
       </Box>
 
       {/* Statistics Cards */}

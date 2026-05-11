@@ -6,13 +6,14 @@
 
 import sqlite3
 import json
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-import pickle
 
 from .backend import StorageBackend
 from ..definition import SimulationDefinition
+from ..definition.function_workflow import function_from_source
 from ..schema import InputSchema, OutputSchema
 from ..config import get_logger
 
@@ -20,7 +21,12 @@ logger = get_logger()
 
 
 class SQLiteBackend(StorageBackend):
-    """SQLite storage backend"""
+    """SQLite storage backend.
+
+    Uses a per-thread connection pool (``threading.local``) so concurrent
+    callers each get their own SQLite connection. WAL journal mode is
+    enabled for better read concurrency under load.
+    """
 
     def __init__(self, db_path: Path):
         """Initialize SQLite backend
@@ -29,6 +35,7 @@ class SQLiteBackend(StorageBackend):
             db_path: Path to SQLite database file
         """
         self.db_path = Path(db_path)
+        self._local = threading.local()
         self._ensure_database()
 
     def _ensure_database(self):
@@ -48,11 +55,15 @@ class SQLiteBackend(StorageBackend):
         with open(schema_file, 'r') as f:
             schema_sql = f.read()
 
-        # Create database and tables
+        # Create database and tables (using a fresh connection so the per-thread
+        # pool doesn't end up holding a long-lived handle to a freshly created
+        # file with stale metadata).
         conn = sqlite3.connect(self.db_path)
-        conn.executescript(schema_sql)
-        conn.commit()
-        conn.close()
+        try:
+            conn.executescript(schema_sql)
+            conn.commit()
+        finally:
+            conn.close()
 
     @classmethod
     def create_database(cls, db_path: Path):
@@ -65,9 +76,24 @@ class SQLiteBackend(StorageBackend):
         backend._create_database()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get database connection"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # Enable column access by name
+        """Return the per-thread connection, opening one if needed.
+
+        Replaces the previous open-on-every-call pattern, which serialized
+        all access through SQLite's file lock. The first call from a given
+        thread also enables WAL mode for better read concurrency.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row  # column access by name
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                # WAL mode isn't supported on all filesystems (eg. some NFS
+                # mounts). Continue with the default journal mode rather than
+                # failing hard.
+                pass
+            self._local.conn = conn
         return conn
 
     def deploy(self, simulation: SimulationDefinition) -> int:
@@ -128,91 +154,80 @@ class SQLiteBackend(StorageBackend):
             conn.rollback()
             raise ValueError(f"Simulation {simulation.name} v{simulation.version} already exists") from e
 
-        finally:
-            conn.close()
-
     def load(self, name: str, version: Optional[str] = None) -> SimulationDefinition:
         """Load a simulation from database"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            if version is None:
-                # Load latest version
-                cursor.execute("""
-                    SELECT * FROM simulations
-                    WHERE name = ? AND status = 'active'
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (name,))
-            else:
-                cursor.execute("""
-                    SELECT * FROM simulations
-                    WHERE name = ? AND version = ?
-                """, (name, version))
+        if version is None:
+            # Load latest version
+            cursor.execute("""
+                SELECT * FROM simulations
+                WHERE name = ? AND status = 'active'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (name,))
+        else:
+            cursor.execute("""
+                SELECT * FROM simulations
+                WHERE name = ? AND version = ?
+            """, (name, version))
 
-            row = cursor.fetchone()
+        row = cursor.fetchone()
 
-            if row is None:
-                version_str = f"v{version}" if version else "(latest)"
-                raise ValueError(f"Simulation {name} {version_str} not found")
+        if row is None:
+            version_str = f"v{version}" if version else "(latest)"
+            raise ValueError(f"Simulation {name} {version_str} not found")
 
-            # Deserialize schemas
-            input_schema = InputSchema.from_dict(json.loads(row['input_schema']))
-            output_schema = OutputSchema.from_dict(json.loads(row['output_schema']))
+        # Deserialize schemas
+        input_schema = InputSchema.from_dict(json.loads(row['input_schema']))
+        output_schema = OutputSchema.from_dict(json.loads(row['output_schema']))
 
-            # Get workflow
-            workflow_bytes = row['workflow_data']
-            workflow_type = row['workflow_type']
+        # Get workflow
+        workflow_bytes = row['workflow_data']
+        workflow_type = row['workflow_type']
 
-            # Deserialize workflow based on type
-            if workflow_type == 'function':
-                workflow = pickle.loads(workflow_bytes)
-            else:
-                # For notebooks, keep as bytes
-                workflow = workflow_bytes
+        # Deserialize workflow based on type
+        if workflow_type == 'function':
+            workflow = function_from_source(workflow_bytes)
+        else:
+            # For notebooks, keep as bytes
+            workflow = workflow_bytes
 
-            # Deserialize metadata
-            tags = json.loads(row['tags']) if row['tags'] else []
-            dependencies = json.loads(row['dependencies']) if row['dependencies'] else []
+        # Deserialize metadata
+        tags = json.loads(row['tags']) if row['tags'] else []
+        dependencies = json.loads(row['dependencies']) if row['dependencies'] else []
 
-            # Create simulation definition
-            sim_def = SimulationDefinition(
-                name=row['name'],
-                version=row['version'],
-                inputs=input_schema,
-                outputs=output_schema,
-                workflow=workflow,
-                description=row['description'] or '',
-                author=row['author'] or '',
-                tags=tags,
-                dependencies=dependencies,
-                workflow_type=workflow_type,
-            )
+        # Create simulation definition
+        sim_def = SimulationDefinition(
+            name=row['name'],
+            version=row['version'],
+            inputs=input_schema,
+            outputs=output_schema,
+            workflow=workflow,
+            description=row['description'] or '',
+            author=row['author'] or '',
+            tags=tags,
+            dependencies=dependencies,
+            workflow_type=workflow_type,
+        )
 
-            # Store the database ID as metadata
-            sim_def._db_id = row['id']
+        # Store the database ID as metadata
+        sim_def._db_id = row['id']
 
-            return sim_def
-
-        finally:
-            conn.close()
+        return sim_def
 
     def exists(self, name: str, version: str) -> bool:
         """Check if simulation exists"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                SELECT 1 FROM simulations
-                WHERE name = ? AND version = ?
-            """, (name, version))
+        cursor.execute("""
+            SELECT 1 FROM simulations
+            WHERE name = ? AND version = ?
+        """, (name, version))
 
-            return cursor.fetchone() is not None
-
-        finally:
-            conn.close()
+        return cursor.fetchone() is not None
 
     def list(
         self,
@@ -223,95 +238,79 @@ class SQLiteBackend(StorageBackend):
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            if tags:
-                # Filter by tags
-                placeholders = ','.join('?' * len(tags))
-                cursor.execute(f"""
-                    SELECT DISTINCT s.* FROM simulations s
-                    JOIN simulation_tags st ON s.id = st.simulation_id
-                    WHERE st.tag IN ({placeholders}) AND s.status = ?
-                    ORDER BY s.name, s.version
-                """, (*tags, status))
-            else:
-                cursor.execute("""
-                    SELECT * FROM simulations
-                    WHERE status = ?
-                    ORDER BY name, version
-                """, (status,))
+        if tags:
+            # Filter by tags
+            placeholders = ','.join('?' * len(tags))
+            cursor.execute(f"""
+                SELECT DISTINCT s.* FROM simulations s
+                JOIN simulation_tags st ON s.id = st.simulation_id
+                WHERE st.tag IN ({placeholders}) AND s.status = ?
+                ORDER BY s.name, s.version
+            """, (*tags, status))
+        else:
+            cursor.execute("""
+                SELECT * FROM simulations
+                WHERE status = ?
+                ORDER BY name, version
+            """, (status,))
 
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    'id': row['id'],
-                    'name': row['name'],
-                    'version': row['version'],
-                    'description': row['description'],
-                    'author': row['author'],
-                    'tags': json.loads(row['tags']) if row['tags'] else [],
-                    'created_at': row['created_at'],
-                    'status': row['status'],
-                })
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'id': row['id'],
+                'name': row['name'],
+                'version': row['version'],
+                'description': row['description'],
+                'author': row['author'],
+                'tags': json.loads(row['tags']) if row['tags'] else [],
+                'created_at': row['created_at'],
+                'status': row['status'],
+            })
 
-            return results
-
-        finally:
-            conn.close()
+        return results
 
     def delete(self, name: str, version: str):
         """Delete a simulation"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                DELETE FROM simulations
-                WHERE name = ? AND version = ?
-            """, (name, version))
+        cursor.execute("""
+            DELETE FROM simulations
+            WHERE name = ? AND version = ?
+        """, (name, version))
 
-            if cursor.rowcount == 0:
-                raise ValueError(f"Simulation {name} v{version} not found")
+        if cursor.rowcount == 0:
+            raise ValueError(f"Simulation {name} v{version} not found")
 
-            conn.commit()
-            logger.info(f"Deleted simulation {name} v{version}")
-
-        finally:
-            conn.close()
+        conn.commit()
+        logger.info(f"Deleted simulation {name} v{version}")
 
     def update_status(self, name: str, version: str, status: str):
         """Update simulation status"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                UPDATE simulations
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE name = ? AND version = ?
-            """, (status, name, version))
+        cursor.execute("""
+            UPDATE simulations
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE name = ? AND version = ?
+        """, (status, name, version))
 
-            if cursor.rowcount == 0:
-                raise ValueError(f"Simulation {name} v{version} not found")
+        if cursor.rowcount == 0:
+            raise ValueError(f"Simulation {name} v{version} not found")
 
-            conn.commit()
-            logger.info(f"Updated simulation {name} v{version} status to {status}")
-
-        finally:
-            conn.close()
+        conn.commit()
+        logger.info(f"Updated simulation {name} v{version} status to {status}")
 
     def get_simulation_id(self, name: str, version: str) -> Optional[int]:
         """Get simulation ID from name and version"""
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        try:
-            cursor.execute("""
-                SELECT id FROM simulations
-                WHERE name = ? AND version = ?
-            """, (name, version))
+        cursor.execute("""
+            SELECT id FROM simulations
+            WHERE name = ? AND version = ?
+        """, (name, version))
 
-            row = cursor.fetchone()
-            return row['id'] if row else None
-
-        finally:
-            conn.close()
+        row = cursor.fetchone()
+        return row['id'] if row else None

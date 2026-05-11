@@ -14,15 +14,18 @@ def serialize_for_hashing(value: Any) -> Any:
     """Convert value to a JSON-serializable primitive for hashing/caching.
 
     Handles:
-    - Pint Quantity objects → magnitude (units discarded for hash key)
+    - Pint Quantity objects → {"__magnitude__": ..., "__units__": str} (units preserved)
     - NumPy arrays → nested Python lists
     - NumPy scalars → Python int/float
     - Lists/tuples → lists (recursively processed)
     - Dicts → dicts (recursively processed)
     - All other types returned unchanged
     """
-    if hasattr(value, 'magnitude'):
-        return serialize_for_hashing(value.magnitude)
+    if hasattr(value, 'magnitude') and hasattr(value, 'units'):
+        return {
+            "__magnitude__": serialize_for_hashing(value.magnitude),
+            "__units__": str(value.units),
+        }
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, (np.integer, np.floating)):
@@ -52,7 +55,22 @@ def serialize_output_value(value: Any) -> Any:
 
 
 class JsonEncoder(json.JSONEncoder):
-    """Custom JSON encoder that handles NumPy arrays and other types"""
+    """Custom JSON encoder that handles NumPy arrays and other types.
+
+    By default this encoder does NOT use ``jsonpickle`` for unknown objects:
+    jsonpickle's decoder can deserialize arbitrary classes, which is RCE-prone
+    when consumed by anything that round-trips untrusted data. Callers that
+    need the legacy behaviour (e.g. for in-process artifact round-tripping
+    where the source is trusted) can opt back in via ``allow_pickle=True``.
+    """
+
+    # Class-level default. Construct with ``allow_pickle=True`` to override.
+    allow_pickle: bool = False
+
+    def __init__(self, *args, allow_pickle: bool | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if allow_pickle is not None:
+            self.allow_pickle = allow_pickle
 
     def default(self, obj):
         """Encode object to JSON-serializable format"""
@@ -90,11 +108,16 @@ class JsonEncoder(json.JSONEncoder):
                 "size": obj.size,
             }
 
-        # Fallback to jsonpickle for complex objects
-        try:
-            return json.loads(jsonpickle.encode(obj))
-        except Exception:
-            return super().default(obj)
+        if self.allow_pickle:
+            # Last-resort path for trusted inputs only. jsonpickle's output
+            # embeds class names that the decoder would later resolve and
+            # instantiate — so do not use this with data crossing trust
+            # boundaries (REST APIs, untrusted disk, etc.).
+            try:
+                return json.loads(jsonpickle.encode(obj))
+            except Exception:
+                pass
+        return super().default(obj)
 
 
 class JsonDecoder:
