@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Box,
   Container,
@@ -26,29 +26,54 @@ export function Dashboard() {
   const [overviewStats, setOverviewStats] = useState<any>(null);
   const [loading, setLoading] = useState(true);
 
+  // Review item #T14: replace the unconditional 10s setInterval with a
+  // self-scheduling poll loop that backs off when the API is unreachable.
+  // The previous setup fired four requests every ten seconds whether the
+  // services were up or not — which slammed a downed backend with a
+  // refresh storm. The new schedule:
+  //   - 10s when the last poll succeeded
+  //   - 20s / 40s / 60s on consecutive failures, capped at 60s
+  // ``cancelled`` lets the unmount cleanup short-circuit a pending poll.
+  const consecutiveFailures = useRef(0);
+
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 10000); // Refresh every 10s
-    return () => clearInterval(interval);
+    let cancelled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const [health, cache, overview] = await Promise.all([
+          apiClient.checkAllServices(),
+          cacheService.getStats().catch(() => null),
+          catalogService.getOverviewStats().catch(() => null),
+        ]);
+        if (cancelled) return;
+        setServiceHealth(health);
+        setCacheStats(cache);
+        setOverviewStats(overview);
+        consecutiveFailures.current = 0;
+      } catch (error) {
+        if (cancelled) return;
+        console.error('Failed to load dashboard data:', error);
+        consecutiveFailures.current = Math.min(consecutiveFailures.current + 1, 3);
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          const delay = 10_000 * Math.max(1, Math.pow(2, consecutiveFailures.current));
+          // 10s / 20s / 40s / 80s — clamp to 60s so we don't go idle for
+          // longer than the user's notion of "live" dashboard.
+          timeout = setTimeout(tick, Math.min(delay, 60_000));
+        }
+      }
+    };
+
+    tick();
+    return () => {
+      cancelled = true;
+      if (timeout) clearTimeout(timeout);
+    };
   }, []);
-
-  const loadData = async () => {
-    try {
-      const [health, cache, overview] = await Promise.all([
-        apiClient.checkAllServices(),
-        cacheService.getStats().catch(() => null),
-        catalogService.getOverviewStats().catch(() => null),
-      ]);
-
-      setServiceHealth(health);
-      setCacheStats(cache);
-      setOverviewStats(overview);
-      setLoading(false);
-    } catch (error) {
-      console.error('Failed to load dashboard data:', error);
-      setLoading(false);
-    }
-  };
 
   const ServiceStatusCard = ({ name, status }: { name: string; status: any }) => {
     const isHealthy = status?.status === 'healthy';

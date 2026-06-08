@@ -15,6 +15,8 @@ Usage:
     pytest tests/web_ui/test_backend_services_functional.py -vv
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import time

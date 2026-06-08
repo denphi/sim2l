@@ -93,6 +93,10 @@ class SQLiteBackend(StorageBackend):
                 # mounts). Continue with the default journal mode rather than
                 # failing hard.
                 pass
+            # FK enforcement is OFF by default in SQLite — the schema's
+            # ON DELETE CASCADE clauses silently no-op without this PRAGMA.
+            # Review item #C5.
+            conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn = conn
         return conn
 

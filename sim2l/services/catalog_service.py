@@ -9,6 +9,9 @@ Provides REST API for tool discovery, registration, and statistics
 with session-based authentication. Supports both SQLite and PostgreSQL.
 """
 
+# Keep `X | None` annotations evaluatable on Python 3.8/3.9 (see requires-python).
+from __future__ import annotations
+
 import os
 import sys
 import argparse
@@ -21,20 +24,28 @@ import hashlib
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
 
 # Shared service helpers (see sim2l/services/_common.py).
 from sim2l.services._common import (
+    LoginRateLimiter,
     adapt_postgres_schema_for_sqlite as _adapt_postgres_schema_for_sqlite,
+    client_ip as _client_ip,
     extract_session_id as _extract_session_id,
     utcnow as _utcnow,
 )
+
+# Review item #T15: throttle credential guesses against /session/login.
+# In-process state is fine for the single-replica dev/test deployment;
+# multi-replica deployments would need to swap this for a shared store.
+_login_limiter = LoginRateLimiter(max_attempts=5, window_seconds=60.0)
 import sim2l
 from sim2l.definition import SimulationDefinition
 from sim2l.schema import InputSchema, OutputSchema
 from sim2l.executor import IsolatedFunctionExecutor, LocalExecutor, NotebookExecutor
+from sim2l.database.cache_client import CacheClient
 from sim2l.database.results_client import ResultsClient
 
 logging.basicConfig(
@@ -334,15 +345,22 @@ def _simulation_from_catalog_record(record: dict) -> SimulationDefinition:
     )
 
 
-def _register_service_result(result, params: dict, outputs: dict, session_id: Optional[str]) -> None:
+def _register_service_result(
+    result,
+    params: dict,
+    outputs: dict,
+    session_id: Optional[str],
+    *,
+    results_session_id: Optional[str] = None,
+) -> bool:
     """Mirror a catalog-service run to the configured results service."""
     config = sim2l.get_config()
     if not config.results_service_url:
-        return
+        return False
 
     client = ResultsClient(
         config.results_service_url,
-        session_id=config.results_session_id or session_id,
+        session_id=results_session_id or config.results_session_id or session_id,
     )
     client.register_direct(
         execution_id=result.execution_id,
@@ -355,6 +373,49 @@ def _register_service_result(result, params: dict, outputs: dict, session_id: Op
         duration_seconds=result.duration_seconds,
         run_db_path="",
         metadata={"source": "catalog_service.run"},
+    )
+    return True
+
+
+def _store_service_cache_entry(
+    result,
+    sim_record: dict,
+    params: dict,
+    session_id: Optional[str],
+    *,
+    cache_session_id: Optional[str] = None,
+) -> bool:
+    """Mirror a completed catalog-service run to the configured cache service."""
+    config = sim2l.get_config()
+    if not config.cache_service_url or result.status != "completed" or not result.squid_id:
+        return False
+
+    from sim2l.utils.serialization import serialize_for_hashing
+
+    serializable_inputs = serialize_for_hashing(params)
+    input_hash = hashlib.sha256(
+        json.dumps(serializable_inputs, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+    client = CacheClient(
+        config.cache_service_url,
+        session_id=cache_session_id or config.cache_session_id or session_id,
+    )
+    return client.set(
+        cache_key=result.squid_id,
+        simulation_id=sim_record["id"],
+        simulation_name=result.simulation_name,
+        simulation_version=result.simulation_version,
+        execution_id=result.execution_id,
+        squid_id=result.squid_id,
+        input_hash=input_hash,
+        run_db_path="",
+        ttl_seconds=None,
+        metadata={
+            "source": "catalog_service.run",
+            "duration_seconds": result.duration_seconds,
+            "executor_type": result.executor_type,
+        },
     )
 
 
@@ -374,6 +435,17 @@ class CatalogServiceBackend:
         raise NotImplementedError
 
     def delete_simulation(self, simulation_id, session_id):
+        raise NotImplementedError
+
+    def clear_all_simulations(self, session_id):
+        """Delete every simulation and its dependent rows in one transaction.
+
+        Review item #T6: the previous route handler shelled out to
+        ``delete_simulation`` per row, executing 5+ DELETEs per simulation
+        and starting a fresh transaction each time. With FK CASCADEs in
+        place we can do this in a single statement set; backends override
+        this to use their dialect.
+        """
         raise NotImplementedError
 
     def record_execution(self, data):
@@ -429,6 +501,9 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
+            # Enable FK enforcement so the schema's CASCADEs actually fire.
+            # Review item #C5.
+            conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn = conn
         return conn
 
@@ -513,6 +588,40 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             if self._check_privilege(session_id, privilege):
                 return {"allowed": True}, 200
         return {"error": "Insufficient privileges"}, 403
+
+    def _mirror_session_for_login(self, session) -> None:
+        """Insert a freshly-authenticated session into the SQL ``sessions``
+        table so subsequent requests (which validate against the DB rather
+        than the in-process ``SessionManager``) accept it. Review item #T1.
+
+        ``session`` is a ``sim2l.database.session_manager.Session`` instance.
+        """
+        import json as _json
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        # Ensure the user row exists so the FK is satisfied. We treat the
+        # SessionManager's numeric ids as authoritative.
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO users (id, username, role)
+            VALUES (?, ?, ?)
+            """,
+            (session.user_id, session.username, "user"),
+        )
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO sessions (
+                session_id, user_id, expires_at, is_valid, privileges
+            ) VALUES (?, ?, ?, 1, ?)
+            """,
+            (
+                session.session_id,
+                session.user_id,
+                session.expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                _json.dumps(list(session.privileges)),
+            ),
+        )
+        conn.commit()
 
     def search(self, query, tags, status, limit):
         import json
@@ -713,30 +822,40 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             except ValueError as exc:
                 return {"error": str(exc)}, 400
 
+        # Keys that map to JSON-encoded columns vs. plain text columns. Any
+        # update key not in either set is silently ignored by the UPDATE —
+        # we report those back to the caller so a typo doesn't look like a
+        # successful no-op. Review item #C3.
+        _JSON_KEYS = {
+            "tags", "dependencies", "metadata",
+            "input_schema", "output_schema", "workflow_bundle",
+        }
+        _PLAIN_KEYS = {
+            "description", "status", "visibility", "license",
+            "workflow_type", "workflow_hash",
+        }
+        _WORKFLOW_BUNDLE_ALIASES = {
+            "workflow_files", "workflow_entrypoint", "workflow_data",
+            "workflow_data_base64", "dockerfile", "docker_context_files",
+        }
+
         set_clauses = []
         params = []
+        ignored_keys: list[str] = []
 
         for key, value in normalized_updates.items():
-            if key in [
-                "tags",
-                "dependencies",
-                "metadata",
-                "input_schema",
-                "output_schema",
-                "workflow_bundle",
-            ]:
+            if key in _JSON_KEYS:
                 set_clauses.append(f"{key} = ?")
                 params.append(json.dumps(value))
-            elif key in [
-                "description",
-                "status",
-                "visibility",
-                "license",
-                "workflow_type",
-                "workflow_hash",
-            ]:
+            elif key in _PLAIN_KEYS:
                 set_clauses.append(f"{key} = ?")
                 params.append(value)
+            elif key in _WORKFLOW_BUNDLE_ALIASES:
+                # These were already collapsed into ``workflow_bundle`` above
+                # by ``_normalize_workflow_bundle``; nothing to report.
+                continue
+            else:
+                ignored_keys.append(key)
 
         if not set_clauses:
             return {"error": "No valid fields to update"}, 400
@@ -750,7 +869,10 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         )
 
         conn.commit()
-        return {"status": "updated"}, 200
+        response: Dict[str, Any] = {"status": "updated"}
+        if ignored_keys:
+            response["ignored_keys"] = sorted(ignored_keys)
+        return response, 200
 
     def delete_simulation(self, simulation_id, session_id):
         if not self._check_privilege(session_id, "catalog_update"):
@@ -767,7 +889,12 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         if not simulation:
             return {"error": "Simulation not found"}, 404
 
-        # execution_registry does not cascade on simulation delete in this schema.
+        # Wrap the entire cascade in a single IMMEDIATE transaction so a
+        # mid-loop IntegrityError (or any other failure) rolls back the
+        # partial cleanup instead of leaving orphaned rows behind. Most of
+        # these tables now CASCADE via FK (#C5 turned that on), but keep
+        # the explicit deletes as belt-and-suspenders for tables without
+        # CASCADE and for any rows the FK system might miss. Review item #C4.
         cleanup_statements = [
             ("DELETE FROM execution_registry WHERE simulation_id = ?", (simulation_id,)),
             ("DELETE FROM execution_stats WHERE simulation_id = ?", (simulation_id,)),
@@ -778,19 +905,29 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
                 (simulation_id, simulation_id),
             ),
         ]
-        for statement, params in cleanup_statements:
-            try:
-                cursor.execute(statement, params)
-            except Exception as exc:
-                # Backward compatibility for older SQLite DBs that may miss optional tables.
-                if "no such table" in str(exc).lower():
-                    logger.debug(f"Skipping cleanup statement due to missing table: {statement}")
-                else:
-                    raise
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            for statement, params in cleanup_statements:
+                try:
+                    cursor.execute(statement, params)
+                except Exception as exc:
+                    # Older SQLite DBs may miss some optional tables — treat
+                    # only that specific case as a skip. Anything else aborts
+                    # the transaction.
+                    if "no such table" in str(exc).lower():
+                        logger.debug(
+                            "Skipping cleanup statement due to missing table: %s",
+                            statement,
+                        )
+                    else:
+                        raise
 
-        cursor.execute("DELETE FROM simulations WHERE id = ?", (simulation_id,))
-        deleted_count = cursor.rowcount
-        conn.commit()
+            cursor.execute("DELETE FROM simulations WHERE id = ?", (simulation_id,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         if deleted_count == 0:
             return {"error": "Simulation not found"}, 404
@@ -804,6 +941,42 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             "name": simulation["name"],
             "version": simulation["version"],
         }, 200
+
+    def clear_all_simulations(self, session_id):
+        # Review item #T6: replace the previous per-row delete loop in the
+        # route handler with a single transactional cleanup. FK CASCADEs
+        # (#C5) handle most dependent tables; the explicit DELETEs cover
+        # rows that predate the FK migration.
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in (
+                "DELETE FROM execution_registry",
+                "DELETE FROM execution_stats",
+                "DELETE FROM simulation_tags",
+                "DELETE FROM access_control",
+                "DELETE FROM simulation_dependencies",
+            ):
+                try:
+                    cursor.execute(statement)
+                except Exception as exc:
+                    if "no such table" in str(exc).lower():
+                        logger.debug("Skipping cleanup statement: %s", statement)
+                    else:
+                        raise
+            cursor.execute("DELETE FROM simulations")
+            deleted = cursor.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        logger.info("Cleared %d simulation(s)", deleted)
+        return {"status": "cleared", "deleted": deleted}, 200
 
     def record_execution(self, data):
         import json
@@ -952,12 +1125,23 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             cursor.execute("SELECT COUNT(*) FROM simulations WHERE status = 'active'")
             active_simulations = cursor.fetchone()[0]
 
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS successful,
+                    SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) AS cached
+                FROM execution_registry
+                """
+            )
+            row = cursor.fetchone() or (0, 0, 0)
+
             return {
                 "total_simulations": total_simulations,
                 "active_simulations": active_simulations,
-                "total_executions": 0,
-                "successful_executions": 0,
-                "cached_executions": 0,
+                "total_executions": row[0] or 0,
+                "successful_executions": row[1] or 0,
+                "cached_executions": row[2] or 0,
             }, 200
         except Exception as e:
             logger.error(f"Error getting overview stats: {e}", exc_info=True)
@@ -991,7 +1175,11 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
             "SELECT expires_at FROM sessions WHERE session_id = ?", (session_id,)
         )
         row = cursor.fetchone()
-        return {"session_id": session_id, "expires_at": row[0] if row else None}, 200
+        return {
+            "token": session_id,
+            "session_id": session_id,
+            "expires_at": row[0] if row else None,
+        }, 200
 
     def health_check(self):
         try:
@@ -1132,6 +1320,37 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             if self._check_privilege(session_id, privilege):
                 return {"allowed": True}, 200
         return {"error": "Insufficient privileges"}, 403
+
+    def _mirror_session_for_login(self, session) -> None:
+        """PG twin of SQLite's _mirror_session_for_login (review #T1)."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO users (id, username, role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (session.user_id, session.username, "user"),
+        )
+        cursor.execute(
+            """
+            INSERT INTO sessions (
+                session_id, user_id, expires_at, is_valid, privileges
+            ) VALUES (%s, %s, %s, true, %s::jsonb)
+            ON CONFLICT (session_id) DO UPDATE SET
+                expires_at = EXCLUDED.expires_at,
+                is_valid = true,
+                privileges = EXCLUDED.privileges
+            """,
+            (
+                session.session_id,
+                session.user_id,
+                session.expires_at,
+                json.dumps(list(session.privileges)),
+            ),
+        )
+        conn.commit()
 
     def _normalize_json(self, value):
         if value is None:
@@ -1344,30 +1563,37 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             except ValueError as exc:
                 return {"error": str(exc)}, 400
 
+        # Same allow-list shape as the SQLite path (review item #C3): keys
+        # that aren't in either set are reported back as ``ignored_keys``
+        # so a typo doesn't look like a silent successful no-op.
+        _JSON_KEYS = {
+            "tags", "dependencies", "metadata",
+            "input_schema", "output_schema", "workflow_bundle",
+        }
+        _PLAIN_KEYS = {
+            "description", "status", "visibility", "license",
+            "workflow_type", "workflow_hash",
+        }
+        _WORKFLOW_BUNDLE_ALIASES = {
+            "workflow_files", "workflow_entrypoint", "workflow_data",
+            "workflow_data_base64", "dockerfile", "docker_context_files",
+        }
+
         set_clauses = []
         params = []
+        ignored_keys: list[str] = []
 
         for key, value in normalized_updates.items():
-            if key in [
-                "tags",
-                "dependencies",
-                "metadata",
-                "input_schema",
-                "output_schema",
-                "workflow_bundle",
-            ]:
+            if key in _JSON_KEYS:
                 set_clauses.append(f"{key} = %s::jsonb")
                 params.append(json.dumps(value))
-            elif key in [
-                "description",
-                "status",
-                "visibility",
-                "license",
-                "workflow_type",
-                "workflow_hash",
-            ]:
+            elif key in _PLAIN_KEYS:
                 set_clauses.append(f"{key} = %s")
                 params.append(value)
+            elif key in _WORKFLOW_BUNDLE_ALIASES:
+                continue
+            else:
+                ignored_keys.append(key)
 
         if not set_clauses:
             return {"error": "No valid fields to update"}, 400
@@ -1383,7 +1609,10 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         )
         conn.commit()
 
-        return {"status": "updated"}, 200
+        response: Dict[str, Any] = {"status": "updated"}
+        if ignored_keys:
+            response["ignored_keys"] = sorted(ignored_keys)
+        return response, 200
 
     def delete_simulation(self, simulation_id, session_id):
         if not self._check_privilege(session_id, "catalog_update"):
@@ -1424,6 +1653,40 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             "name": simulation["name"],
             "version": simulation["version"],
         }, 200
+
+    def clear_all_simulations(self, session_id):
+        # Review item #T6: single-transaction cleanup instead of the route
+        # handler's per-row delete loop.
+        if not self._check_privilege(session_id, "catalog_update"):
+            return {"error": "Insufficient privileges"}, 403
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        try:
+            for statement in (
+                "DELETE FROM execution_registry",
+                "DELETE FROM execution_stats",
+                "DELETE FROM simulation_tags",
+                "DELETE FROM access_control",
+                "DELETE FROM simulation_dependencies",
+            ):
+                try:
+                    cursor.execute(statement)
+                except Exception as exc:
+                    if "does not exist" in str(exc).lower():
+                        logger.debug("Skipping cleanup statement: %s", statement)
+                        conn.rollback()
+                    else:
+                        raise
+            cursor.execute("DELETE FROM simulations")
+            deleted = cursor.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        logger.info("Cleared %d simulation(s)", deleted)
+        return {"status": "cleared", "deleted": deleted}, 200
 
     def record_execution(self, data):
         conn = self._get_conn()
@@ -1616,7 +1879,11 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
             return {"error": "Session not found or already expired"}, 404
         conn.commit()
         expires_at = row.get("expires_at") if isinstance(row, dict) else row[0]
-        return {"session_id": session_id, "expires_at": str(expires_at)}, 200
+        return {
+            "token": session_id,
+            "session_id": session_id,
+            "expires_at": str(expires_at),
+        }, 200
 
     def health_check(self):
         try:
@@ -1651,6 +1918,63 @@ def refresh_session():
 
     result, status_code = catalog_db.refresh_session(session_id)
     return jsonify(result), status_code
+
+
+@app.route("/session/login", methods=["POST"])
+def login():
+    """Authenticate with username/password, return a session id.
+
+    Review items #W6 and #T1: the returned session id is both registered
+    with the in-process ``SessionManager`` AND inserted into the catalog's
+    backing ``sessions`` table so that the next request (which goes through
+    ``_check_session`` against the SQL table) actually finds it.
+
+    Web clients still need to call ``/session/login`` on the cache and
+    results services too — each service maintains its own session table.
+    """
+    from sim2l.database.session_manager import get_session_manager
+
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        return jsonify({"error": "username and password are required"}), 400
+
+    # Review item #T15: rate-limit per (ip, username). Each attempt counts
+    # against the bucket whether it succeeds or fails — a successful login
+    # resets it. That keeps the limiter from blocking the legitimate user
+    # but still caps total login traffic.
+    ip = _client_ip(request)
+    if not _login_limiter.allow(ip, username):
+        return jsonify({
+            "error": "Too many login attempts. Please wait a minute and try again."
+        }), 429
+
+    mgr = get_session_manager()
+    try:
+        session = mgr.authenticate(username, password)
+    except ValueError:
+        # Don't distinguish "unknown user" from "wrong password" — that's
+        # an information leak.
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    # On success, clear the bucket so the user isn't penalised for the
+    # successful attempt counting against the limit.
+    _login_limiter.reset(ip, username)
+
+    # Mirror the session into the catalog's ``sessions`` SQL table so that
+    # subsequent requests (which validate against the DB) succeed.
+    try:
+        catalog_db._mirror_session_for_login(session)
+    except Exception as exc:
+        logger.warning("Could not mirror session into DB on login: %s", exc)
+
+    return jsonify({
+        "token": session.session_id,
+        "session_id": session.session_id,
+        "username": session.username,
+        "expires_at": session.expires_at.isoformat(),
+    }), 200
 
 
 @app.route("/simulations/search", methods=["GET"])
@@ -1726,17 +2050,13 @@ def clear_all_simulations():
             return jsonify({"error": "Missing session ID"}), 401
     else:
         session_id = "no-auth-session"
-
     try:
-        sims, search_status = catalog_db.search(query=None, tags=None, status="all", limit=10000)
-        if search_status != 200:
-            return jsonify({"error": "Could not list simulations"}), search_status
-        deleted = 0
-        for sim in sims:
-            _, status = catalog_db.delete_simulation(sim["id"], session_id)
-            if status == 200:
-                deleted += 1
-        return jsonify({"deleted": deleted}), 200
+        # Review item #T6: backend does the cleanup in a single
+        # transaction now — no N+1 round-trip per simulation.
+        result, status = catalog_db.clear_all_simulations(session_id)
+        if status != 200:
+            return jsonify(result), status
+        return jsonify({"deleted": result.get("deleted", 0)}), 200
     except Exception as exc:
         logger.error(f"Clear all simulations failed: {exc}")
         return jsonify({"error": "Internal server error"}), 500
@@ -1778,10 +2098,17 @@ def run_simulation():
     simulation_name = data.get('simulation_name')
     version = data.get('version')
     params = data.get('params', {})
+    downstream_cache_session_id = request.headers.get("X-Sim2L-Cache-Session-ID")
+    downstream_results_session_id = request.headers.get("X-Sim2L-Results-Session-ID")
 
     if not simulation_name:
         return jsonify({'error': 'simulation_name is required'}), 400
 
+    # Review item #T16: split the try blocks so the 400/echo-raw-text path
+    # only covers loading + executor selection (which is where request-shape
+    # ValueErrors come from). Once execution starts, ``sim.run`` can raise
+    # ValueErrors that surface internal-state details — those route to the
+    # generic 500 handler instead.
     try:
         # Load the simulation from the catalog first. This makes the service
         # API authoritative for simulations registered through /simulations.
@@ -1790,7 +2117,7 @@ def run_simulation():
             sim = _simulation_from_catalog_record(sim_record)
         else:
             sim = sim2l.load_simulation(simulation_name, version=version)
-        
+
         # Use appropriate executor based on workflow type. Catalog function
         # bundles are source-backed and run in a child process so submitted
         # source never executes in the Flask worker process.
@@ -1800,7 +2127,19 @@ def run_simulation():
             executor = IsolatedFunctionExecutor(cache=True, save_result=False)
         else:
             executor = LocalExecutor(cache=True)
-        
+    except ValueError as e:
+        # Loading-time validation errors are caller-visible (400) and
+        # intentionally include the message so the user can fix their
+        # request payload (bad name/version, malformed bundle, etc.).
+        logger.warning("Validation error loading %s: %s", simulation_name, e)
+        message = str(e)
+        status_code = 409 if "no workflow_bundle" in message else 400
+        return jsonify({'error': message}), status_code
+    except Exception as e:
+        logger.error("Error loading simulation %s: %s", simulation_name, e, exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+    try:
         # Run simulation
         import time
         start_time = time.time()
@@ -1844,7 +2183,30 @@ def run_simulation():
                 "warning_count": 0,
                 "environment": {"source": "catalog_service.run"},
             })
-        _register_service_result(result, params, outputs, session_id)
+        results_persisted = False
+        cache_persisted = False
+        try:
+            results_persisted = _register_service_result(
+                result,
+                params,
+                outputs,
+                session_id,
+                results_session_id=downstream_results_session_id,
+            )
+        except Exception as exc:
+            logger.warning("Could not mirror run to results service: %s", exc)
+
+        if sim_status == 200 and sim_record and sim_record.get("id"):
+            try:
+                cache_persisted = _store_service_cache_entry(
+                    result,
+                    sim_record,
+                    params,
+                    session_id,
+                    cache_session_id=downstream_cache_session_id,
+                )
+            except Exception as exc:
+                logger.warning("Could not mirror run to cache service: %s", exc)
             
         return jsonify({
             'success': True,
@@ -1852,15 +2214,21 @@ def run_simulation():
             'squid_id': result.squid_id,
             'status': result.status,
             'duration_seconds': result.duration_seconds or elapsed_time,
-            'outputs': outputs
+            'outputs': outputs,
+            'persistence': {
+                'catalog_execution': bool(sim_status == 200 and sim_record and sim_record.get("id")),
+                'results': results_persisted,
+                'cache': cache_persisted,
+            },
         })
 
-    except ValueError as e:
-        logger.error(f"Validation error running simulation {simulation_name}: {e}")
-        return jsonify({'error': str(e)}), 400
     except Exception as e:
-        logger.error(f"Error executing simulation {simulation_name}: {e}", exc_info=True)
-        return jsonify({'error': f"Execution failed: {str(e)}"}), 500
+        # Anything raised by sim.run / serialization is server-internal
+        # — review items #C1 and #T16. We log with traceback but return a
+        # generic message so internal paths / state never reach the
+        # caller.
+        logger.error("Error executing simulation %s: %s", simulation_name, e, exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route("/simulations/<int:simulation_id>/stats", methods=["GET"])

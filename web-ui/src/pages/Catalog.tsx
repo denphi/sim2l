@@ -39,6 +39,7 @@ import {
 } from '@mui/icons-material';
 import { catalogService } from '../api/catalogService';
 import { SubmitRunModal } from '../components/catalog/SubmitRunModal';
+import { ConfirmDestructiveDialog } from '../components/common/ConfirmDestructiveDialog';
 import type { Simulation, OverviewStats, ExecutionStats } from '../types/catalog';
 
 export function Catalog() {
@@ -51,6 +52,7 @@ export function Catalog() {
   const [selectedSimName, setSelectedSimName] = useState('');
   const [selectedSimVersion, setSelectedSimVersion] = useState<string | undefined>(undefined);
   const [deletingSimulationId, setDeletingSimulationId] = useState<number | null>(null);
+  const [clearAllOpen, setClearAllOpen] = useState(false);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   // Cache full simulation details (with input/output schema) fetched on expand
   const [simDetails, setSimDetails] = useState<Record<string, Simulation>>({});
@@ -103,16 +105,11 @@ export function Catalog() {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [simsResponse, statsResponse] = await Promise.all([
+      const [sims, statsResponse] = await Promise.all([
         catalogService.searchSimulations(searchTerm),
         catalogService.getOverviewStats(),
       ]);
-
-      // Handle both array and object responses
-      const sims = Array.isArray(simsResponse)
-        ? simsResponse
-        : (simsResponse.simulations || []);
-
+      // searchSimulations now always returns Simulation[]; review #W3.
       setSimulations(sims);
       setStats(statsResponse);
     } catch (error) {
@@ -127,19 +124,13 @@ export function Catalog() {
     loadData();
   };
 
+  // Review item #W4/#W5: irreversible op → typed-confirm modal, not
+  // window.confirm. The handler the modal calls runs the actual delete;
+  // the dialog drives the user-confirmation UI and the busy/error state.
   const handleClearAll = async () => {
-    const confirmed = window.confirm(
-      `Delete ALL simulations from the catalog? This cannot be undone.`
-    );
-    if (!confirmed) return;
-    try {
-      const result = await catalogService.clearAllSimulations();
-      window.alert(`Cleared ${result.deleted} simulation(s).`);
-      await loadData();
-    } catch (error) {
-      console.error('Failed to clear catalog:', error);
-      window.alert('Failed to clear catalog. See browser console for details.');
-    }
+    const result = await catalogService.clearAllSimulations();
+    window.alert(`Cleared ${result.deleted} simulation(s).`);
+    await loadData();
   };
 
   const handleDeleteSimulation = async (sim: Simulation) => {
@@ -203,10 +194,19 @@ export function Catalog() {
             variant="outlined"
             color="error"
             size="small"
-            onClick={handleClearAll}
+            onClick={() => setClearAllOpen(true)}
           >
             Clear All
           </Button>
+          <ConfirmDestructiveDialog
+            open={clearAllOpen}
+            title="Clear all simulations?"
+            description="This permanently deletes every simulation in the catalog and all of its execution history. There is no undo."
+            confirmPhrase="DELETE ALL"
+            confirmLabel="Delete all simulations"
+            onConfirm={handleClearAll}
+            onClose={() => setClearAllOpen(false)}
+          />
           <Tooltip title="Refresh">
             <IconButton onClick={loadData} color="primary">
               <RefreshIcon />

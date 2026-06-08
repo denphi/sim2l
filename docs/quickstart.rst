@@ -192,6 +192,7 @@ Workflow 4: Result Search
 
 .. code-block:: python
 
+    import sim2l
     from sim2l import configure
     from sim2l.database import ResultsClient, get_session_manager
 
@@ -210,11 +211,20 @@ Workflow 4: Result Search
         print(f"Registered run at {temp}K")
 
     # Search for results
-    results = client.search(
+    results = sim2l.search_results(
         simulation_name="thermal_sim",
-        input_filters={'temperature': 350}
+        input_filters={'temperature': 350},
+        session_id=session.session_id,
     )
     print(f"Found {len(results)} runs at 350K")
+
+    # Or list recent registered results
+    recent = sim2l.list_results(
+        simulation_name="thermal_sim",
+        limit=10,
+        session_id=session.session_id,
+    )
+    print(f"Found {len(recent)} recent runs")
 
     # Get statistics
     stats = client.get_parameter_stats(

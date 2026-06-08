@@ -19,6 +19,10 @@ from flask import Flask, request, jsonify
 
 from ..database.run_database import RunDatabase
 from ..database.session_manager import get_session_manager, Session
+from ._common import LoginRateLimiter, client_ip as _client_ip
+
+# Review item #T15: per-(ip, username) login throttle.
+_login_limiter = LoginRateLimiter(max_attempts=5, window_seconds=60.0)
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +42,13 @@ class ResultsBackend:
         schema_data: Dict[str, Any]
     ) -> int:
         """Register or update a simulation schema."""
+        raise NotImplementedError
+
+    def get_schema(
+        self, tool_name: str, tool_version: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the stored ``{"id", "inputs", "outputs"}`` for a
+        ``(tool, version)`` pair, or None if none is on file. Review #R6."""
         raise NotImplementedError
 
     def register_result(
@@ -72,6 +83,14 @@ class ResultsBackend:
 
     def delete_result(self, execution_id: str) -> Tuple[Dict[str, Any], int]:
         """Delete a specific execution result."""
+        raise NotImplementedError
+
+    def delete_all(self) -> int:
+        """Delete every execution result in a single transaction.
+
+        Returns the number of rows deleted. Review item #R5 — replaces a
+        loop that round-tripped per row.
+        """
         raise NotImplementedError
 
     def get_parameter_stats(
@@ -124,6 +143,9 @@ class SQLiteResultsBackend(ResultsBackend):
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
+            # Enable FK enforcement so the schema's CASCADEs actually fire.
+            # Review item #C5.
+            conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn = conn
         return conn
 
@@ -261,6 +283,29 @@ class SQLiteResultsBackend(ResultsBackend):
         result = cursor.fetchone()
         return result[0] if result else None
 
+    def get_schema(
+        self, tool_name: str, tool_version: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return ``{"id", "inputs", "outputs"}`` or None. Review #R6."""
+        import json
+        cursor = self._get_conn().cursor()
+        cursor.execute(
+            """
+            SELECT id, schema_data FROM simulation_schemas
+            WHERE tool_name = ? AND tool_version = ?
+            """,
+            (tool_name, tool_version),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        data = json.loads(row["schema_data"]) if row["schema_data"] else {}
+        return {
+            "id": row["id"],
+            "inputs": data.get("inputs") or {},
+            "outputs": data.get("outputs") or {},
+        }
+
     def register_result(
         self,
         execution_id: str,
@@ -343,6 +388,12 @@ class SQLiteResultsBackend(ResultsBackend):
             # Simple equality check
             return value == filter_spec
 
+    # When input/output filters are evaluated in Python we don't know how
+    # many DB rows to fetch up-front. Stream through rows and stop after
+    # ``limit`` matches, capping total scanned rows so a request that
+    # matches nothing doesn't read the entire table.
+    _SEARCH_MAX_SCAN = 10_000
+
     def search_results(
         self,
         simulation_name: Optional[str] = None,
@@ -352,6 +403,16 @@ class SQLiteResultsBackend(ResultsBackend):
         output_filters: Optional[Dict[str, Any]] = None,
         limit: int = 100
     ) -> List[Dict[str, Any]]:
+        """Search execution results.
+
+        SQL-side filters (``simulation_name``, ``simulation_version``,
+        ``status``) are applied in the WHERE clause. Python-side filters
+        (``input_filters`` / ``output_filters``) operate on the deserialized
+        JSON params and are applied after fetch. The LIMIT is applied
+        **after** the Python filters — review item #R1 — so 100 rows that
+        all fail the filter don't shadow another 1,000 matching rows further
+        back in time.
+        """
         import json
         cursor = self._get_conn().cursor()
 
@@ -361,7 +422,7 @@ class SQLiteResultsBackend(ResultsBackend):
             FROM execution_results
             WHERE 1=1
         """
-        params = []
+        params: List[Any] = []
 
         if simulation_name:
             query += " AND simulation_name = ?"
@@ -375,14 +436,28 @@ class SQLiteResultsBackend(ResultsBackend):
             query += " AND status = ?"
             params.append(status)
 
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY created_at DESC"
+
+        has_python_filters = bool(input_filters) or bool(output_filters)
+        if not has_python_filters:
+            # Fast path: SQL LIMIT is correct when there are no post-filters.
+            query += " LIMIT ?"
+            params.append(limit)
 
         cursor.execute(query, params)
-        rows = cursor.fetchall()
 
-        results = []
-        for row in rows:
+        results: List[Dict[str, Any]] = []
+        scanned = 0
+        for row in cursor:
+            scanned += 1
+            if scanned > self._SEARCH_MAX_SCAN:
+                logger.warning(
+                    "search_results scan cap hit (%d rows) — returning %d matches; "
+                    "narrow the SQL-side filters or push filters into SQL.",
+                    self._SEARCH_MAX_SCAN, len(results),
+                )
+                break
+
             result = {
                 'execution_id': row['execution_id'],
                 'simulation_name': row['simulation_name'],
@@ -394,25 +469,21 @@ class SQLiteResultsBackend(ResultsBackend):
                 'created_at': row['created_at']
             }
 
-            # Filter by input params (with operator support)
-            if input_filters:
-                match = all(
-                    self._matches_filter(result['input_params'].get(k), v)
-                    for k, v in input_filters.items()
-                )
-                if not match:
-                    continue
+            if input_filters and not all(
+                self._matches_filter(result['input_params'].get(k), v)
+                for k, v in input_filters.items()
+            ):
+                continue
 
-            # Filter by output params (with operator support)
-            if output_filters:
-                match = all(
-                    self._matches_filter(result['output_params'].get(k), v)
-                    for k, v in output_filters.items()
-                )
-                if not match:
-                    continue
+            if output_filters and not all(
+                self._matches_filter(result['output_params'].get(k), v)
+                for k, v in output_filters.items()
+            ):
+                continue
 
             results.append(result)
+            if len(results) >= limit:
+                break
 
         return results
 
@@ -457,6 +528,26 @@ class SQLiteResultsBackend(ResultsBackend):
             return {'error': 'Result not found'}, 404
 
         return {'status': 'deleted', 'execution_id': execution_id}, 200
+
+    def delete_all(self) -> int:
+        """Bulk-delete every execution result in a single transaction.
+
+        Review item #R5: replaces a per-row delete loop driven from the
+        Flask route handler, which round-tripped through the backend N
+        times for an N-row table.
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            cursor.execute("DELETE FROM result_errors")
+            cursor.execute("DELETE FROM execution_results")
+            deleted = cursor.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return deleted
 
     def get_parameter_stats(
         self,
@@ -552,11 +643,40 @@ class PostgreSQLResultsBackend(ResultsBackend):
         return conn
 
     def _initialize_schema(self):
-        """Initialize PostgreSQL schema from SQL file."""
-        # Schema is already initialized by Docker or previous service startup
-        # The SQL file contains IF NOT EXISTS clauses, so it's safe to skip
-        # if objects already exist
-        logger.debug("PostgreSQL schema already initialized (via Docker or previous startup)")
+        """Apply the PG results schema if its tables aren't already present.
+
+        The SQL file uses ``CREATE TABLE IF NOT EXISTS`` everywhere, so it's
+        safe to run on a database that's already initialized. Review item
+        #R3: previously this method was a no-op, which made a fresh PG DB
+        fail at first query with a confusing "relation does not exist"
+        error.
+        """
+        from pathlib import Path
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT to_regclass('public.simulation_schemas') AS table_oid"
+        )
+        row = cursor.fetchone() or {}
+        if row.get("table_oid"):
+            logger.debug("PostgreSQL results schema already initialized")
+            return
+
+        schema_path = (
+            Path(__file__).parent.parent / "database" / "results_db_schema.sql"
+        )
+        if not schema_path.exists():
+            logger.warning(
+                "PostgreSQL results schema file not found at %s; "
+                "assuming the DB is set up out-of-band.",
+                schema_path,
+            )
+            return
+
+        logger.info("Applying PostgreSQL results schema from %s", schema_path)
+        cursor.execute(schema_path.read_text(encoding="utf-8"))
+        conn.commit()
 
     def register_schema(
         self,
@@ -575,6 +695,32 @@ class PostgreSQLResultsBackend(ResultsBackend):
         result = cursor.fetchone()
         conn.commit()
         return list(result.values())[0] if result else None
+
+    def get_schema(
+        self, tool_name: str, tool_version: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return ``{"id", "inputs", "outputs"}`` or None. Review #R6."""
+        cursor = self._get_conn().cursor()
+        cursor.execute(
+            """
+            SELECT id, schema_data FROM simulation_schemas
+            WHERE tool_name = %s AND tool_version = %s
+            """,
+            (tool_name, tool_version),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        # PG returns JSONB directly as dict via RealDictCursor.
+        data = row.get("schema_data") or {}
+        if isinstance(data, str):
+            import json
+            data = json.loads(data)
+        return {
+            "id": row["id"],
+            "inputs": data.get("inputs") or {},
+            "outputs": data.get("outputs") or {},
+        }
 
     def register_result(
         self,
@@ -687,6 +833,22 @@ class PostgreSQLResultsBackend(ResultsBackend):
             return {'error': 'Result not found'}, 404
 
         return {'status': 'deleted', 'execution_id': execution_id}, 200
+
+    def delete_all(self) -> int:
+        """Bulk-delete every execution result in a single transaction.
+        Review item #R5.
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM result_errors")
+            cursor.execute("DELETE FROM execution_results")
+            deleted = cursor.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return deleted
 
     def get_parameter_stats(
         self,
@@ -851,6 +1013,43 @@ def create_results_service(
             'backend': backend
         })
 
+    @app.route('/session/login', methods=['POST'])
+    def login():
+        """Authenticate and return a session id (review item #T1).
+
+        Unlike catalog/cache, the results service validates sessions
+        directly against the in-process ``SessionManager`` (no separate
+        SQL table). ``SessionManager.authenticate`` already stores the
+        session in-process, so the returned id is immediately usable.
+        """
+        from sim2l.database.session_manager import get_session_manager
+
+        data = request.json or {}
+        username = data.get("username")
+        password = data.get("password")
+        if not username or not password:
+            return jsonify({"error": "username and password are required"}), 400
+
+        ip = _client_ip(request)
+        if not _login_limiter.allow(ip, username):
+            return jsonify({
+                "error": "Too many login attempts. Please wait a minute and try again."
+            }), 429
+
+        try:
+            session = get_session_manager().authenticate(username, password)
+        except ValueError:
+            return jsonify({"error": "Invalid username or password"}), 401
+
+        _login_limiter.reset(ip, username)
+
+        return jsonify({
+            "token": session.session_id,
+            "session_id": session.session_id,
+            "username": session.username,
+            "expires_at": session.expires_at.isoformat(),
+        }), 200
+
     @app.route('/register', methods=['POST'])
     def register_result():
         """Register a simulation result."""
@@ -863,6 +1062,15 @@ def create_results_service(
 
         if not execution_id:
             return jsonify({'error': 'execution_id required'}), 400
+
+        # Reject unsafe ids early with a 400 rather than letting RunDatabase
+        # raise a ValueError that the generic ``except Exception`` below
+        # would coerce into a 500. Review item #T24 (companion to #T2).
+        from ..database.run_database import _validate_safe_id
+        try:
+            _validate_safe_id(execution_id, "execution_id")
+        except ValueError:
+            return jsonify({'error': 'Invalid execution_id'}), 400
 
         try:
             # Introspect the run
@@ -911,7 +1119,10 @@ def create_results_service(
                 error_message=str(e)
             )
 
-            return jsonify({'error': str(e)}), 500
+            # Don't leak raw exception text — clients only need to know it
+            # failed; operators have the full traceback via the logger above.
+            # Review item #R4.
+            return jsonify({'error': 'Internal server error'}), 500
 
     @app.route('/register_direct', methods=['POST'])
     def register_result_direct():
@@ -933,47 +1144,71 @@ def create_results_service(
 
         logger.debug(f"Registering result - Sim: {data['simulation_name']}, Status: {data['status']}")
         try:
-            # Build schema from input/output params
-            schema = {
-                'inputs': {},
-                'outputs': {}
+            # Schema inference is per-call but the schema rows are shared
+            # across calls. Previously each call called register_schema with
+            # only its own values, so two calls with different types for the
+            # same key thrashed the stored schema (review item #R6).
+            #
+            # Now we infer a "delta" schema from this call and merge it with
+            # whatever's already on disk: existing keys keep their type
+            # (first-write wins), new keys are added. If the merge is a no-op
+            # (every key is already known), we skip register_schema entirely.
+            def _infer_type(value):
+                t = type(value).__name__
+                if t in ("float", "int"):
+                    return "number"
+                if t == "str":
+                    return "string"
+                if t == "bool":
+                    return "boolean"
+                if value is None:
+                    return "null"
+                return t
+
+            new_schema = {
+                "inputs": {
+                    name: {"type": _infer_type(val), "unit": None}
+                    for name, val in data["input_params"].items()
+                },
+                "outputs": {
+                    name: {"type": _infer_type(val), "unit": None}
+                    for name, val in data["output_params"].items()
+                },
             }
 
-            # Infer types from parameter values
-            for param_name, param_value in data['input_params'].items():
-                param_type = type(param_value).__name__
-                if param_type == 'float' or param_type == 'int':
-                    param_type = 'number'
-                elif param_type == 'str':
-                    param_type = 'string'
-                elif param_type == 'bool':
-                    param_type = 'boolean'
-
-                schema['inputs'][param_name] = {
-                    'type': param_type,
-                    'unit': None
-                }
-
-            for param_name, param_value in data['output_params'].items():
-                param_type = type(param_value).__name__
-                if param_type == 'float' or param_type == 'int':
-                    param_type = 'number'
-                elif param_type == 'str':
-                    param_type = 'string'
-                elif param_type == 'bool':
-                    param_type = 'boolean'
-
-                schema['outputs'][param_name] = {
-                    'type': param_type,
-                    'unit': None
-                }
-
-            # Register schema
-            schema_id = results_backend.register_schema(
-                data['simulation_name'],
-                data['simulation_version'],
-                schema
+            existing = (
+                results_backend.get_schema(
+                    data["simulation_name"], data["simulation_version"]
+                )
+                if hasattr(results_backend, "get_schema")
+                else None
             )
+            merged = new_schema
+            schema_changed = True
+            if existing:
+                merged = {
+                    "inputs": dict(existing.get("inputs") or {}),
+                    "outputs": dict(existing.get("outputs") or {}),
+                }
+                for section in ("inputs", "outputs"):
+                    for k, v in new_schema[section].items():
+                        # First-write-wins: don't clobber a previously
+                        # inferred type. Only add genuinely new keys.
+                        if k not in merged[section]:
+                            merged[section][k] = v
+                schema_changed = merged != {
+                    "inputs": existing.get("inputs") or {},
+                    "outputs": existing.get("outputs") or {},
+                }
+
+            if schema_changed:
+                schema_id = results_backend.register_schema(
+                    data["simulation_name"],
+                    data["simulation_version"],
+                    merged,
+                )
+            else:
+                schema_id = existing.get("id") if isinstance(existing, dict) else None
 
             # Register result
             logger.debug(f"Registering schema for {data['simulation_name']} v{data['simulation_version']}")
@@ -1009,7 +1244,8 @@ def create_results_service(
                 error_message=str(e)
             )
 
-            return jsonify({'error': str(e)}), 500
+            # Same leak fix as /register above (review item #R4).
+            return jsonify({'error': 'Internal server error'}), 500
 
     @app.route('/search', methods=['POST'])
     def search_results():
@@ -1078,17 +1314,11 @@ def create_results_service(
             return auth_result
 
         try:
-            all_results = results_backend.search_results(
-                simulation_name=None, input_filters={}, output_filters={}, limit=100000
-            )
-            deleted = 0
-            for r in all_results:
-                _, status = results_backend.delete_result(r["execution_id"])
-                if status == 200:
-                    deleted += 1
+            # Single backend call → single DB transaction. Review item #R5.
+            deleted = results_backend.delete_all()
             return jsonify({"deleted": deleted}), 200
         except Exception as exc:
-            app.logger.error(f"Clear all results failed: {exc}")
+            app.logger.error(f"Clear all results failed: {exc}", exc_info=True)
             return jsonify({"error": "Internal server error"}), 500
 
     @app.route('/stats/<simulation_name>/<param_name>', methods=['GET'])

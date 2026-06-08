@@ -43,6 +43,7 @@ dependencies = [
     "flask>=2.0",
     "requests>=2.25",
     "psycopg2-binary>=2.9",
+    "bcrypt>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +61,9 @@ docs = [
 ]
 notebooks = [
     "scrapbook>=0.5",
+]
+mcp = [
+    "mcp>=1.0",
 ]
 
 [project.urls]
@@ -87,6 +91,21 @@ sim2l = ["repository/*.sql", "database/*.sql"]
 line-length = 88
 target-version = ['py38', 'py39', 'py310', 'py311']
 include = '\.pyi?$'
+
+[tool.ruff]
+line-length = 88
+# Lowest supported runtime (matches requires-python). Drives the FA rules:
+# any PEP 604 `X | None` annotation used without `from __future__ import
+# annotations` is flagged, because it fails to evaluate at class/def time on
+# Python < 3.10. sim2l must stay importable there — arc imports it inside the
+# legacy-FEniCS/DOLFIN conda env, which ships py39-only builds.
+target-version = "py38"
+
+[tool.ruff.lint]
+# FA102 = future-required-type-annotation: require the future-import wherever
+# PEP 604 `|` union syntax appears, so the code reads modern but stays
+# importable on 3.8/3.9. Scoped narrowly to the compat guard; widen later.
+select = ["FA102"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -10,6 +10,7 @@ outputs, files, logs, and metadata for that run.
 """
 
 import os
+import re
 import sqlite3
 import json
 from datetime import datetime, timezone
@@ -21,6 +22,28 @@ import logging
 def _utcnow() -> datetime:
     """Return current UTC time as a naive datetime (DB-compatible)."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# IDs that flow from HTTP request bodies into filesystem paths must be
+# restricted to filename-safe characters or they enable path traversal
+# (review item #T2). uuid4 and "name-tag-0.1.0" style versions both fit.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _validate_safe_id(value: str, label: str = "id") -> str:
+    """Reject ``value`` if it could escape a filesystem path.
+
+    Used for any user-controlled string that becomes a path component
+    (``RunDatabase`` uses execution_id as a filename, the artifact registry
+    uses artifact_id and version as directory components). Returns the
+    input unchanged on success, raises ``ValueError`` otherwise.
+    """
+    if not isinstance(value, str) or not _SAFE_ID_RE.match(value):
+        raise ValueError(
+            f"Unsafe {label}: {value!r}. Must match {_SAFE_ID_RE.pattern}."
+        )
+    return value
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,41 +62,55 @@ class RunDatabase:
         Initialize a run database.
 
         Args:
-            execution_id: Unique execution ID
+            execution_id: Unique execution ID. Must be filename-safe — see
+                ``_validate_safe_id``. Review item #T2: previously this was
+                interpolated straight into a filesystem path, so an attacker
+                supplying ``"../../etc/foo"`` could escape ``~/.sim2l/runs/``.
             db_path: Path to database file (default: ~/.sim2l/runs/{execution_id}.db)
         """
-        self.execution_id = execution_id
-
+        # Validation is only required when we construct the path ourselves;
+        # callers that pass an explicit ``db_path`` have already chosen it.
         if db_path is None:
+            _validate_safe_id(execution_id, "execution_id")
             runs_dir = Path.home() / ".sim2l" / "runs"
             runs_dir.mkdir(parents=True, exist_ok=True)
             db_path = str(runs_dir / f"{execution_id}.db")
 
+        self.execution_id = execution_id
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
 
         self._ensure_initialized()
 
     def _ensure_initialized(self):
-        """Ensure database exists and schema is created."""
-        is_new = not os.path.exists(self.db_path)
+        """Ensure database exists and schema is created.
 
-        if is_new:
-            self._create_schema()
-            logger.info(f"Created new run database: {self.db_path}")
-        else:
-            self.conn = sqlite3.connect(self.db_path)
-            self.conn.row_factory = sqlite3.Row
-            logger.debug(f"Connected to existing run database: {self.db_path}")
-
-    def _create_schema(self):
-        """Create database schema."""
-        # Read schema from SQL file
-        schema_path = Path(__file__).parent / "run_db_schema.sql"
-
+        Review item #T13: the previous flow checked ``os.path.exists`` and
+        then either created-the-schema or attached, which was a TOCTOU —
+        if two processes opened the same path, both could conclude the
+        file was missing and both would try to run the full schema. We
+        now open the connection unconditionally and let
+        ``CREATE TABLE IF NOT EXISTS`` make the schema bootstrap
+        idempotent on the SQLite side.
+        """
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
+        # Review item #T10: turn on FK enforcement so the schema's
+        # CASCADEs actually fire on delete. PRAGMA is per-connection in
+        # SQLite, so this must be set on every open.
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self._create_schema()
+        logger.debug("Opened run database: %s", self.db_path)
 
+    def _create_schema(self):
+        """Create database schema if it doesn't already exist.
+
+        The bundled schema file uses ``CREATE TABLE IF NOT EXISTS`` /
+        ``CREATE INDEX IF NOT EXISTS``, so running it on an established DB
+        is a no-op. That makes ``_ensure_initialized`` safe to call from
+        concurrent processes (#T13).
+        """
+        schema_path = Path(__file__).parent / "run_db_schema.sql"
         with open(schema_path, "r") as f:
             schema_sql = f.read()
 

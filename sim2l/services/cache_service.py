@@ -19,10 +19,17 @@ from datetime import datetime, timedelta
 
 # Shared service helpers (see sim2l/services/_common.py).
 from sim2l.services._common import (
+    LoginRateLimiter,
     adapt_postgres_schema_for_sqlite as _adapt_postgres_schema_for_sqlite,
+    client_ip as _client_ip,
     extract_session_id as _extract_session_id,
     utcnow as _utcnow,
 )
+
+# Review item #T15: per-(ip, username) login throttle. See catalog_service
+# for the full rationale; same instance can't be shared across services
+# because each service is its own Flask app.
+_login_limiter = LoginRateLimiter(max_attempts=5, window_seconds=60.0)
 from pathlib import Path
 from typing import Optional
 from flask import Flask, request, jsonify
@@ -90,6 +97,16 @@ class CacheServiceBackend:
     def health_check(self):
         raise NotImplementedError
 
+    def mirror_session(self, session) -> None:
+        """Insert/refresh a session row in the backend's session table.
+
+        Used by ``/session/login`` to bridge an authenticated
+        ``SessionManager.Session`` instance into the cache service's
+        ``cache_sessions`` table so subsequent requests are accepted.
+        Review item #T1.
+        """
+        raise NotImplementedError
+
 
 class SQLiteCacheBackend(CacheServiceBackend):
     """SQLite backend for cache service.
@@ -114,6 +131,9 @@ class SQLiteCacheBackend(CacheServiceBackend):
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
+            # Enable FK enforcement so the schema's CASCADEs actually fire.
+            # Review item #C5.
+            conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn = conn
         return conn
 
@@ -151,6 +171,27 @@ class SQLiteCacheBackend(CacheServiceBackend):
             (session_id,),
         )
         return cursor.fetchone() is not None
+
+    def mirror_session(self, session) -> None:
+        access_level = "admin" if "admin" in session.privileges else (
+            "write" if "write" in session.privileges else "read"
+        )
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO cache_sessions (
+                session_id, user_id, expires_at, access_level, is_valid
+            ) VALUES (?, ?, ?, ?, 1)
+            """,
+            (
+                session.session_id,
+                session.user_id,
+                session.expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                access_level,
+            ),
+        )
+        conn.commit()
 
     def get(self, cache_key: str, session_id: str):
         if not self._check_session(session_id):
@@ -512,6 +553,31 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
         )
         return cursor.fetchone() is not None
 
+    def mirror_session(self, session) -> None:
+        access_level = "admin" if "admin" in session.privileges else (
+            "write" if "write" in session.privileges else "read"
+        )
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO cache_sessions (
+                session_id, user_id, expires_at, access_level, is_valid
+            ) VALUES (%s, %s, %s, %s, true)
+            ON CONFLICT (session_id) DO UPDATE SET
+                expires_at = EXCLUDED.expires_at,
+                access_level = EXCLUDED.access_level,
+                is_valid = true
+            """,
+            (
+                session.session_id,
+                session.user_id,
+                session.expires_at,
+                access_level,
+            ),
+        )
+        conn.commit()
+
     def get(self, cache_key: str, session_id: str):
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -792,6 +858,51 @@ class PostgreSQLCacheBackend(CacheServiceBackend):
 def health():
     data, status = cache_db.health_check()
     return jsonify(data), status
+
+
+@app.route("/session/login", methods=["POST"])
+def login():
+    """Authenticate and register a session row in ``cache_sessions``.
+
+    Review item #T1: cache_service has its own session table separate from
+    the catalog's, so a session created via the catalog's /session/login is
+    not recognised here. Web clients call this endpoint with the same
+    credentials to get a cache-service session id.
+    """
+    from sim2l.database.session_manager import get_session_manager
+
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        return jsonify({"error": "username and password are required"}), 400
+
+    ip = _client_ip(request)
+    if not _login_limiter.allow(ip, username):
+        return jsonify({
+            "error": "Too many login attempts. Please wait a minute and try again."
+        }), 429
+
+    try:
+        session = get_session_manager().authenticate(username, password)
+    except ValueError:
+        return jsonify({"error": "Invalid username or password"}), 401
+
+    _login_limiter.reset(ip, username)
+
+    # Mirror into the backend's session table so subsequent requests succeed.
+    try:
+        cache_db.mirror_session(session)
+    except Exception as exc:
+        logger.warning("Could not mirror session into cache_sessions: %s", exc)
+        return jsonify({"error": "Internal server error"}), 500
+
+    return jsonify({
+        "token": session.session_id,
+        "session_id": session.session_id,
+        "username": session.username,
+        "expires_at": session.expires_at.isoformat(),
+    }), 200
 
 
 @app.route("/cache/<path:cache_key>", methods=["GET"])

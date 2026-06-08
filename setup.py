@@ -65,6 +65,9 @@ setup(
         "notebooks": [
             "scrapbook>=0.5",  # For notebook-based simulations
         ],
+        "mcp": [
+            "mcp>=1.0",
+        ],
     },
     entry_points={
         "console_scripts": [

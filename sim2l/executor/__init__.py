@@ -7,11 +7,12 @@
 from .base import Executor
 from .notebook import NotebookExecutor
 from .local import LocalExecutor
-from .isolated import IsolatedFunctionExecutor
+from .isolated import IsolatedFunctionExecutor, SubprocessFunctionExecutor
 
 __all__ = [
     "Executor",
     "NotebookExecutor",
     "LocalExecutor",
     "IsolatedFunctionExecutor",
+    "SubprocessFunctionExecutor",
 ]

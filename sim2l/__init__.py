@@ -51,6 +51,8 @@ from .api import (
     deploy_simulation,
     get_inputs,
     save_outputs,
+    list_results,
+    search_results,
 )
 
 # Utilities
@@ -111,6 +113,8 @@ __all__ = [
     "deploy_simulation",
     "get_inputs",
     "save_outputs",
+    "list_results",
+    "search_results",
 
     # Utilities
     "compute_squid_id",

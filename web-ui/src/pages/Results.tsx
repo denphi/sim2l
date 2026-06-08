@@ -20,6 +20,7 @@ import {
   CardContent,
   Collapse,
   Button,
+  Alert,
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -34,6 +35,8 @@ import {
 } from '@mui/icons-material';
 import { resultsService } from '../api/resultsService';
 import type { ExecutionResult } from '../types/results';
+import { ConfirmDestructiveDialog } from '../components/common/ConfirmDestructiveDialog';
+import { serviceErrorMessage } from '../api/client';
 
 export function Results() {
   const [results, setResults] = useState<ExecutionResult[]>([]);
@@ -47,6 +50,9 @@ export function Results() {
   const [outputFilter, setOutputFilter] = useState('');
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [deletingExecutionId, setDeletingExecutionId] = useState<string | null>(null);
+  const [clearAllOpen, setClearAllOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<ExecutionResult | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
@@ -131,8 +137,10 @@ export function Results() {
       });
 
       setResults(response.results || []);
+      setLoadError(null);
     } catch (error) {
       console.error('Failed to load results:', error);
+      setLoadError(serviceErrorMessage(error, 'Failed to load results'));
       setResults([]);
     } finally {
       setLoading(false);
@@ -154,36 +162,20 @@ export function Results() {
     setTimeout(loadData, 0);
   };
 
-  const handleClearAll = async () => {
-    const confirmed = window.confirm(
-      `Delete ALL results? This cannot be undone.`
-    );
-    if (!confirmed) return;
-    try {
-      const result = await resultsService.clearAllResults();
-      window.alert(`Cleared ${result.deleted} result(s).`);
-      await loadData();
-    } catch (error) {
-      console.error('Failed to clear results:', error);
-      window.alert('Failed to clear results. See browser console for details.');
-    }
+  // Review item #T5: type-to-confirm replaces window.confirm; the dialog
+  // re-throws on failure so the dialog itself shows the error in-place
+  // rather than spawning a window.alert chain.
+  const performClearAll = async () => {
+    const result = await resultsService.clearAllResults();
+    await loadData();
+    window.alert(`Cleared ${result.deleted} result(s).`);
   };
 
-  const handleDeleteResult = async (result: ExecutionResult) => {
-    const confirmed = window.confirm(
-      `Delete result "${result.execution_id}" for ${result.simulation_name}/${result.simulation_version}?`
-    );
-    if (!confirmed) {
-      return;
-    }
-
+  const performDeleteResult = async (result: ExecutionResult) => {
     setDeletingExecutionId(result.execution_id);
     try {
       await resultsService.deleteResult(result.execution_id);
       await loadData();
-    } catch (error) {
-      console.error('Failed to delete result:', error);
-      window.alert('Failed to delete result. See browser console for details.');
     } finally {
       setDeletingExecutionId(null);
     }
@@ -243,7 +235,7 @@ export function Results() {
             variant="outlined"
             color="error"
             size="small"
-            onClick={handleClearAll}
+            onClick={() => setClearAllOpen(true)}
           >
             Clear All
           </Button>
@@ -360,6 +352,12 @@ export function Results() {
         </Grid>
       </Paper>
 
+      {loadError && (
+        <Alert severity="error" sx={{ mb: 3 }}>
+          {loadError}
+        </Alert>
+      )}
+
       {/* Results Table */}
       <Paper>
         <TableContainer>
@@ -443,7 +441,7 @@ export function Results() {
                                 <IconButton
                                   color="error"
                                   size="small"
-                                  onClick={() => handleDeleteResult(result)}
+                                  onClick={() => setPendingDelete(result)}
                                   disabled={deletingExecutionId === result.execution_id}
                                 >
                                   <DeleteIcon fontSize="small" />
@@ -587,6 +585,31 @@ export function Results() {
           </TextField>
         </Box>
       </Paper>
+
+      <ConfirmDestructiveDialog
+        open={clearAllOpen}
+        title="Clear all results"
+        description="This permanently deletes every recorded execution result and cannot be undone."
+        confirmPhrase="DELETE ALL"
+        confirmLabel="Clear all"
+        onConfirm={performClearAll}
+        onClose={() => setClearAllOpen(false)}
+      />
+      <ConfirmDestructiveDialog
+        open={pendingDelete !== null}
+        title="Delete result"
+        description={
+          pendingDelete
+            ? `Delete result "${pendingDelete.execution_id}" for ${pendingDelete.simulation_name}/${pendingDelete.simulation_version}? This cannot be undone.`
+            : ''
+        }
+        confirmPhrase="DELETE"
+        confirmLabel="Delete result"
+        onConfirm={async () => {
+          if (pendingDelete) await performDeleteResult(pendingDelete);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </Container>
   );
 }

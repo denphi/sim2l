@@ -400,10 +400,12 @@ class FileManager:
         from .run_database import RunDatabase
 
         try:
-            run_db = RunDatabase(execution_id)
-            artifacts = run_db.get_artifacts()
+            # Review item #T9: use the context manager so the underlying
+            # sqlite3 connection is released — these callers used to leak
+            # one connection per request.
+            with RunDatabase(execution_id) as run_db:
+                artifacts = run_db.get_artifacts()
 
-            # Convert artifacts to file metadata format
             files = []
             for artifact in artifacts:
                 file_info = {
@@ -421,7 +423,7 @@ class FileManager:
                 files.append(file_info)
 
             return files
-        except Exception as e:
+        except Exception:
             # Run database not found or error reading
             return []
 
@@ -498,27 +500,21 @@ class FileManager:
         from .run_database import RunDatabase
 
         try:
-            run_db = RunDatabase(execution_id)
-            artifacts = run_db.get_artifacts()
+            # Review item #T9: same fix as get_run_files above.
+            with RunDatabase(execution_id) as run_db:
+                artifacts = run_db.get_artifacts()
 
-            # Find the requested file
             for artifact in artifacts:
                 if artifact['name'] == file_name:
-                    # Write content to output path
                     content = artifact.get('content', b'')
-
-                    # Create directory if needed
                     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-
-                    # Write file
                     mode = 'wb' if isinstance(content, bytes) else 'w'
                     with open(output_path, mode) as f:
                         f.write(content)
-
                     return True
 
             return False
-        except Exception as e:
+        except Exception:
             return False
 
     def search(

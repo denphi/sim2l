@@ -126,18 +126,18 @@ if os.environ.get("SIM2L_USE_RUN_DATABASE"):
     _config.use_run_database = os.environ["SIM2L_USE_RUN_DATABASE"].lower() in ("true", "1", "yes")
 if os.environ.get("SIM2L_RUN_DB_BASE_PATH"):
     _config.run_db_base_path = Path(os.environ["SIM2L_RUN_DB_BASE_PATH"])
-if os.environ.get("SIM2L_CACHE_SERVICE_URL"):
-    _config.cache_service_url = os.environ["SIM2L_CACHE_SERVICE_URL"]
+if os.environ.get("SIM2L_CACHE_SERVICE_URL") or os.environ.get("SIM2L_CACHE_URL"):
+    _config.cache_service_url = os.environ.get("SIM2L_CACHE_SERVICE_URL") or os.environ["SIM2L_CACHE_URL"]
 if os.environ.get("SIM2L_CACHE_SESSION_ID"):
     _config.cache_session_id = os.environ["SIM2L_CACHE_SESSION_ID"]
-if os.environ.get("SIM2L_CATALOG_SERVICE_URL"):
-    _config.catalog_service_url = os.environ["SIM2L_CATALOG_SERVICE_URL"]
+if os.environ.get("SIM2L_CATALOG_SERVICE_URL") or os.environ.get("SIM2L_CATALOG_URL"):
+    _config.catalog_service_url = os.environ.get("SIM2L_CATALOG_SERVICE_URL") or os.environ["SIM2L_CATALOG_URL"]
 if os.environ.get("SIM2L_CATALOG_SESSION_ID"):
     _config.catalog_session_id = os.environ["SIM2L_CATALOG_SESSION_ID"]
 if os.environ.get("SIM2L_CATALOG_AUTO_SYNC"):
     _config.catalog_auto_sync = os.environ["SIM2L_CATALOG_AUTO_SYNC"].lower() in ("true", "1", "yes")
-if os.environ.get("SIM2L_RESULTS_SERVICE_URL"):
-    _config.results_service_url = os.environ["SIM2L_RESULTS_SERVICE_URL"]
+if os.environ.get("SIM2L_RESULTS_SERVICE_URL") or os.environ.get("SIM2L_RESULTS_URL"):
+    _config.results_service_url = os.environ.get("SIM2L_RESULTS_SERVICE_URL") or os.environ["SIM2L_RESULTS_URL"]
 if os.environ.get("SIM2L_RESULTS_SESSION_ID"):
     _config.results_session_id = os.environ["SIM2L_RESULTS_SESSION_ID"]
 

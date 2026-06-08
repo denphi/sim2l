@@ -1,5 +1,5 @@
 // Cache Service API Client
-import { apiClient } from './client';
+import { apiClient, serviceErrorMessage } from './client';
 import type {
   CacheEntry,
   CacheStats,
@@ -45,23 +45,35 @@ export class CacheServiceClient {
   }
 
   async invalidate(filters: InvalidationFilters): Promise<InvalidationResult> {
-    const response = await apiClient.cache.post<InvalidationResult>('/cache/invalidate', filters);
-    return response.data;
+    try {
+      const response = await apiClient.cache.post<InvalidationResult>('/cache/invalidate', filters);
+      return response.data;
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to invalidate cache entries'));
+    }
   }
 
   async deleteEntry(cacheKey: string): Promise<{ status: string; cache_key: string }> {
-    const response = await apiClient.cache.delete<{ status?: string; cache_key?: string }>(
-      `/cache/${encodeURIComponent(cacheKey)}`
-    );
-    return {
-      status: response.data.status || 'deleted',
-      cache_key: response.data.cache_key || cacheKey,
-    };
+    try {
+      const response = await apiClient.cache.delete<{ status?: string; cache_key?: string }>(
+        `/cache/${encodeURIComponent(cacheKey)}`
+      );
+      return {
+        status: response.data.status || 'deleted',
+        cache_key: response.data.cache_key || cacheKey,
+      };
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to delete cache entry'));
+    }
   }
 
   async clearAllEntries(): Promise<{ deleted: number }> {
-    const response = await apiClient.cache.delete<{ deleted: number }>('/cache');
-    return response.data;
+    try {
+      const response = await apiClient.cache.delete<{ deleted: number }>('/cache');
+      return response.data;
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to clear cache entries'));
+    }
   }
 
   async getHotEntries(limit: number = 10): Promise<{ entries: CacheEntry[] }> {

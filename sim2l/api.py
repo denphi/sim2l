@@ -5,7 +5,7 @@
 """High-level API functions for sim2l"""
 
 from pathlib import Path
-from typing import Union, Optional, Dict, Any
+from typing import Union, Optional, Dict, Any, List
 import os
 
 from .definition import SimulationDefinition
@@ -192,6 +192,113 @@ def save_outputs(**outputs: Any):
                 logger.debug(f"Scrapbook cannot encode '{name}': {e}")
     except ImportError:
         logger.debug("scrapbook not installed")
+
+
+def _results_service_url(base_url: Optional[str] = None) -> str:
+    """Resolve the Results Service URL for high-level result queries."""
+    if base_url:
+        return base_url
+
+    from .config import get_config
+
+    configured = get_config().results_service_url
+    env_url = (
+        os.environ.get("SIM2L_RESULTS_SERVICE_URL")
+        or os.environ.get("SIM2L_RESULTS_URL")
+    )
+    return configured or env_url or "http://localhost:8003"
+
+
+def _results_session_id(session_id: Optional[str] = None) -> Optional[str]:
+    """Resolve the Results Service session id for high-level result queries."""
+    if session_id:
+        return session_id
+
+    from .config import get_config
+
+    return (
+        get_config().results_session_id
+        or os.environ.get("SIM2L_RESULTS_SESSION_ID")
+    )
+
+
+def search_results(
+    simulation_name: Optional[str] = None,
+    simulation_version: Optional[str] = None,
+    status: Optional[str] = None,
+    input_filters: Optional[Dict[str, Any]] = None,
+    output_filters: Optional[Dict[str, Any]] = None,
+    limit: int = 100,
+    *,
+    base_url: Optional[str] = None,
+    session_id: Optional[str] = None,
+    timeout: int = 30,
+) -> List[Dict[str, Any]]:
+    """Search registered execution results through the Results Service.
+
+    Args:
+        simulation_name: Optional simulation name filter.
+        simulation_version: Optional simulation version filter.
+        status: Optional execution status filter, e.g. ``"completed"``.
+        input_filters: Filters over stored input parameters.
+        output_filters: Filters over stored output parameters.
+        limit: Maximum number of results to return.
+        base_url: Results Service URL. Defaults to configured/env URL, then
+            ``http://localhost:8003``.
+        session_id: Optional Results Service session id.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        List of matching result dictionaries.
+
+    Example:
+        >>> import sim2l
+        >>> rows = sim2l.search_results(
+        ...     simulation_name="thermal_sim",
+        ...     input_filters={"temperature": {"$gte": 350}},
+        ... )
+    """
+    from .database import ResultsClient
+
+    client = ResultsClient(
+        base_url=_results_service_url(base_url),
+        session_id=_results_session_id(session_id),
+        timeout=timeout,
+    )
+    return client.search(
+        simulation_name=simulation_name,
+        simulation_version=simulation_version,
+        status=status,
+        input_filters=input_filters,
+        output_filters=output_filters,
+        limit=limit,
+    )
+
+
+def list_results(
+    simulation_name: Optional[str] = None,
+    simulation_version: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+    *,
+    base_url: Optional[str] = None,
+    session_id: Optional[str] = None,
+    timeout: int = 30,
+) -> List[Dict[str, Any]]:
+    """List registered execution results through the Results Service.
+
+    This is a convenience wrapper around :func:`search_results` with no
+    parameter filters.
+    """
+    return search_results(
+        simulation_name=simulation_name,
+        simulation_version=simulation_version,
+        status=status,
+        limit=limit,
+        base_url=base_url,
+        session_id=session_id,
+        timeout=timeout,
+    )
 
 
 def set_notebook_context(inputs: InputSchema = None, outputs: Dict[str, Any] = None):

@@ -146,6 +146,8 @@ class ResultsClient:
     def search(
         self,
         simulation_name: Optional[str] = None,
+        simulation_version: Optional[str] = None,
+        status: Optional[str] = None,
         input_filters: Optional[Dict[str, Any]] = None,
         output_filters: Optional[Dict[str, Any]] = None,
         limit: int = 100
@@ -155,6 +157,8 @@ class ResultsClient:
 
         Args:
             simulation_name: Filter by simulation name
+            simulation_version: Filter by simulation version
+            status: Filter by execution status
             input_filters: Dict of input parameter filters
             output_filters: Dict of output parameter filters
             limit: Maximum number of results
@@ -167,6 +171,8 @@ class ResultsClient:
                 f"{self.base_url}/search",
                 json={
                     'simulation_name': simulation_name,
+                    'simulation_version': simulation_version,
+                    'status': status,
                     'input_filters': input_filters or {},
                     'output_filters': output_filters or {},
                     'limit': limit

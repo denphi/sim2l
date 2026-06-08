@@ -1,5 +1,5 @@
 // Results Service API Client
-import { apiClient } from './client';
+import { apiClient, serviceErrorMessage } from './client';
 import type {
   ExecutionResult,
   ParameterStats,
@@ -27,18 +27,26 @@ export class ResultsServiceClient {
   }
 
   async deleteResult(executionId: string): Promise<{ status: string; execution_id: string }> {
-    const response = await apiClient.results.delete<{ status?: string; execution_id?: string }>(
-      `/results/${encodeURIComponent(executionId)}`
-    );
-    return {
-      status: response.data.status || 'deleted',
-      execution_id: response.data.execution_id || executionId,
-    };
+    try {
+      const response = await apiClient.results.delete<{ status?: string; execution_id?: string }>(
+        `/results/${encodeURIComponent(executionId)}`
+      );
+      return {
+        status: response.data.status || 'deleted',
+        execution_id: response.data.execution_id || executionId,
+      };
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to delete result'));
+    }
   }
 
   async clearAllResults(): Promise<{ deleted: number }> {
-    const response = await apiClient.results.delete<{ deleted: number }>('/results');
-    return response.data;
+    try {
+      const response = await apiClient.results.delete<{ deleted: number }>('/results');
+      return response.data;
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to clear results'));
+    }
   }
 
   async getParameterStats(simulationName: string, paramName: string): Promise<ParameterStats> {
@@ -112,7 +120,7 @@ export class ResultsServiceClient {
       console.error('Error submitting run:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Failed to submit run',
+        error: serviceErrorMessage(error, 'Failed to submit run'),
       };
     }
   }

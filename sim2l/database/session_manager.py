@@ -6,6 +6,9 @@
 Session management for authentication and privilege checking.
 """
 
+# Keep `X | None` annotations evaluatable on Python 3.8/3.9 (see requires-python).
+from __future__ import annotations
+
 import os
 import secrets
 import uuid
@@ -20,6 +23,86 @@ logger = logging.getLogger(__name__)
 def _is_dev_mode() -> bool:
     """Return True when the process is started in dev/test mode."""
     return os.environ.get("SIM2L_DEV_MODE", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _admin_password_file() -> "pathlib.Path":
+    """Path to the persistent random admin password file.
+
+    Shared across services so all three (cache / catalog / results) agree on
+    the same admin credential, instead of generating three different
+    one-shot random passwords (review item #S8).
+    """
+    import pathlib
+
+    base = pathlib.Path(os.environ.get("SIM2L_HOME", str(pathlib.Path.home() / ".sim2l")))
+    return base / "admin_password"
+
+
+def _read_persisted_admin_password() -> Optional[str]:
+    """Return the persisted admin password from disk, or None if absent."""
+    path = _admin_password_file()
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except (FileNotFoundError, PermissionError):
+        return None
+    except OSError as exc:
+        logger.warning("Could not read admin password file %s: %s", path, exc)
+        return None
+
+
+def _persist_admin_password(password: str) -> tuple["Optional[pathlib.Path]", str]:
+    """Atomically claim the admin-password file with this password.
+
+    Returns ``(path, persisted_password)``. When two service processes start
+    concurrently and both call this function, only the first ``O_EXCL`` open
+    wins. The losing caller reads the existing file and reports back the
+    winner's password — so all services end up agreeing on a single
+    credential. Review items #S7 and #T3.
+    """
+    import pathlib
+
+    path = _admin_password_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Could not create admin password file dir %s: %s", path, exc)
+        return None, password
+
+    # O_CREAT | O_EXCL: succeed only if we create the file. If it already
+    # exists (race or prior run), fall back to reading whatever the winner
+    # wrote.
+    try:
+        fd = os.open(
+            str(path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        try:
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return path, existing
+        except OSError as exc:
+            logger.warning("Could not read existing admin password file %s: %s", path, exc)
+        # Neither create-fresh nor read-existing worked; fall through.
+        return None, password
+    except OSError as exc:
+        logger.warning("Could not write admin password file %s: %s", path, exc)
+        return None, password
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(password)
+    except OSError as exc:
+        logger.warning("Failed writing admin password file %s: %s", path, exc)
+        return None, password
+
+    # Belt-and-suspenders chmod in case the umask widened the perms.
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+    return path, password
 
 
 def _utcnow() -> datetime:
@@ -96,50 +179,76 @@ class SessionManager:
         # Create default admin user (password chosen by environment/dev-mode)
         self._create_default_admin()
 
-    def _resolve_admin_password(self) -> Optional[str]:
-        """Pick the admin password to use, or None to skip default-admin creation.
+    def _resolve_admin_password(self) -> tuple[Optional[str], str]:
+        """Pick the admin password and report the source.
+
+        Returns ``(password, source)`` where ``source`` is one of:
+          - ``"env"``     – ``SIM2L_ADMIN_PASSWORD`` env var
+          - ``"file"``    – persisted file under ``~/.sim2l/admin_password``
+          - ``"dev"``     – dev-mode literal ``"admin"``
+          - ``"random"``  – caller must generate and persist
 
         Resolution order:
-        1. ``SIM2L_ADMIN_PASSWORD`` env var: explicit operator-supplied password.
-        2. ``dev_mode`` (constructor arg or ``SIM2L_DEV_MODE`` env): use the
-           well-known literal ``"admin"`` so tests and local development work.
-        3. Otherwise: generate a random password, log it once, and use it.
-           This keeps the service starting in production deployments where
-           the operator forgot to set a password — but the credential is not
-           the well-known ``admin/admin``.
+        1. ``SIM2L_ADMIN_PASSWORD`` env var (explicit operator override).
+        2. Persisted password file (shared across services — review #S8).
+        3. Dev mode literal ``"admin"``.
+        4. Otherwise: caller generates a new random password and persists it.
         """
         explicit = os.environ.get("SIM2L_ADMIN_PASSWORD")
         if explicit:
-            return explicit
+            return explicit, "env"
+        persisted = _read_persisted_admin_password()
+        if persisted:
+            return persisted, "file"
         if self._dev_mode:
-            return "admin"
-        return None  # caller will substitute a random password
+            return "admin", "dev"
+        return None, "random"
 
     def _create_default_admin(self):
         """Create the default admin user.
 
-        The password depends on environment — see ``_resolve_admin_password``.
-        Production deployments without ``SIM2L_ADMIN_PASSWORD`` get a randomly
-        generated password printed once to the log, NOT the well-known
-        ``admin``. This avoids the "anyone with the codebase has admin"
-        footgun while still letting the service boot.
+        Production deployments without ``SIM2L_ADMIN_PASSWORD`` get a random
+        password written to ``~/.sim2l/admin_password`` (0600). The
+        credential is NOT logged — review item #S7. Subsequent service
+        startups reuse the file so all three services (cache / catalog /
+        results) agree on the same admin (#S8).
         """
-        password = self._resolve_admin_password()
-        log_note: str
+        password, source = self._resolve_admin_password()
         if password is None:
-            password = secrets.token_urlsafe(24)
-            log_note = (
-                f"Default admin user created with random password: {password!r}. "
-                f"Set SIM2L_ADMIN_PASSWORD to control this, or SIM2L_DEV_MODE=true "
-                f"to use the literal 'admin' for development/testing."
-            )
-            logger.warning(log_note)
-        elif self._dev_mode and password == "admin":
+            # Generate a candidate; the actual persisted password may differ
+            # if another service raced us and wrote first (review #T3).
+            candidate = secrets.token_urlsafe(24)
+            path, password = _persist_admin_password(candidate)
+            if path is not None:
+                logger.warning(
+                    "Default admin user created with random password. "
+                    "Read it from %s (mode 0600). Set SIM2L_ADMIN_PASSWORD "
+                    "to override, or SIM2L_DEV_MODE=true for the literal "
+                    "'admin' (development only).",
+                    path,
+                )
+            else:
+                # Persistence failed (read-only HOME, permission error). Fall
+                # back to a one-shot log so the operator can still recover —
+                # this is now the unusual case rather than the default.
+                logger.warning(
+                    "Default admin user created with random password (could "
+                    "not persist to disk). Password: %r. Set "
+                    "SIM2L_ADMIN_PASSWORD next time to control this.",
+                    password,
+                )
+            source = "random"
+        elif source == "dev":
             logger.warning(
                 "Default admin user created with password 'admin' (dev mode). "
                 "DO NOT use this configuration outside development."
             )
-        else:
+        elif source == "file":
+            logger.info(
+                "Default admin user loaded from persisted password file %s.",
+                _admin_password_file(),
+            )
+        elif source == "env":
             logger.info(
                 "Default admin user created with password from SIM2L_ADMIN_PASSWORD."
             )
@@ -225,9 +334,9 @@ class SessionManager:
         # Determine privileges based on role
         role = user["role"]
         if role == "admin":
-            privileges = ["admin", "read", "write", "catalog_update"]
+            privileges = ["admin", "read", "write", "catalog_update", "execute", "run"]
         elif role == "developer":
-            privileges = ["read", "write", "catalog_update"]
+            privileges = ["read", "write", "catalog_update", "execute", "run"]
         else:
             privileges = ["read", "write"]
 

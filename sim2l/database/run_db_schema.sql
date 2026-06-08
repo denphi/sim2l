@@ -6,7 +6,7 @@
 -- One database per execution run, stores complete run information
 
 -- Metadata about this run
-CREATE TABLE run_metadata (
+CREATE TABLE IF NOT EXISTS run_metadata (
     execution_id TEXT PRIMARY KEY,
     squid_id TEXT,
     simulation_name TEXT NOT NULL,
@@ -29,7 +29,7 @@ CREATE TABLE run_metadata (
 );
 
 -- Input parameters for this run
-CREATE TABLE inputs (
+CREATE TABLE IF NOT EXISTS inputs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     type TEXT NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE inputs (
 );
 
 -- Output results from this run
-CREATE TABLE outputs (
+CREATE TABLE IF NOT EXISTS outputs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     type TEXT NOT NULL,
@@ -53,7 +53,7 @@ CREATE TABLE outputs (
 );
 
 -- Files and artifacts produced during run
-CREATE TABLE artifacts (
+CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     path TEXT, -- Relative path within run directory
@@ -68,7 +68,7 @@ CREATE TABLE artifacts (
 );
 
 -- Execution logs (structured)
-CREATE TABLE logs (
+CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     level TEXT NOT NULL, -- 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
@@ -81,7 +81,7 @@ CREATE TABLE logs (
 );
 
 -- Cell execution tracking (for notebook runs)
-CREATE TABLE cell_executions (
+CREATE TABLE IF NOT EXISTS cell_executions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     cell_index INTEGER NOT NULL,
     cell_type TEXT, -- 'code', 'markdown'
@@ -97,7 +97,7 @@ CREATE TABLE cell_executions (
 );
 
 -- Performance metrics
-CREATE TABLE metrics (
+CREATE TABLE IF NOT EXISTS metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     metric_name TEXT NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE metrics (
 );
 
 -- Resource usage tracking
-CREATE TABLE resource_usage (
+CREATE TABLE IF NOT EXISTS resource_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     cpu_percent REAL,
@@ -121,7 +121,7 @@ CREATE TABLE resource_usage (
 );
 
 -- Provenance and lineage
-CREATE TABLE provenance (
+CREATE TABLE IF NOT EXISTS provenance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL, -- 'input', 'output', 'artifact', 'intermediate'
     entity_name TEXT NOT NULL,
@@ -132,20 +132,20 @@ CREATE TABLE provenance (
 );
 
 -- Tags for categorization
-CREATE TABLE tags (
+CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tag TEXT NOT NULL UNIQUE
 );
 
 -- Many-to-many relationship for tags
-CREATE TABLE run_tags (
+CREATE TABLE IF NOT EXISTS run_tags (
     tag_id INTEGER NOT NULL,
     FOREIGN KEY (tag_id) REFERENCES tags(id),
     PRIMARY KEY (tag_id)
 );
 
 -- Checkpoints for long-running simulations
-CREATE TABLE checkpoints (
+CREATE TABLE IF NOT EXISTS checkpoints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     checkpoint_name TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -156,16 +156,16 @@ CREATE TABLE checkpoints (
 );
 
 -- Indexes for common queries
-CREATE INDEX idx_logs_timestamp ON logs(timestamp);
-CREATE INDEX idx_logs_level ON logs(level);
-CREATE INDEX idx_artifacts_category ON artifacts(category);
-CREATE INDEX idx_artifacts_hash ON artifacts(content_hash);
-CREATE INDEX idx_cell_executions_status ON cell_executions(status);
-CREATE INDEX idx_metrics_name ON metrics(metric_name);
-CREATE INDEX idx_provenance_entity ON provenance(entity_type, entity_name);
+CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+CREATE INDEX IF NOT EXISTS idx_artifacts_category ON artifacts(category);
+CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_cell_executions_status ON cell_executions(status);
+CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(metric_name);
+CREATE INDEX IF NOT EXISTS idx_provenance_entity ON provenance(entity_type, entity_name);
 
 -- Views for common queries
-CREATE VIEW run_summary AS
+CREATE VIEW IF NOT EXISTS run_summary AS
 SELECT
     rm.execution_id,
     rm.squid_id,
@@ -196,7 +196,7 @@ LEFT JOIN artifacts a ON 1=1
 LEFT JOIN logs l ON 1=1
 GROUP BY rm.execution_id;
 
-CREATE VIEW error_summary AS
+CREATE VIEW IF NOT EXISTS error_summary AS
 SELECT
     timestamp,
     logger,

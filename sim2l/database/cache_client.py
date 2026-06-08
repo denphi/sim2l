@@ -12,9 +12,18 @@ with session-based authentication.
 import requests
 import logging
 from typing import Dict, Optional, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """Naive UTC ``datetime`` — replacement for the deprecated
+    ``datetime.utcnow()``. Naive output is preserved so callers that compare
+    against `datetime.fromisoformat(...)` results (also naive) stay correct.
+    Review item #T7.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class CacheClient:
@@ -256,14 +265,23 @@ class CacheClient:
 
 
 class LocalCacheClient:
-    """
-    Local in-memory cache implementation for development/testing.
+    """Local in-memory cache implementation for development/testing.
 
-    Provides the same interface as CacheClient but stores cache entries
-    in memory. Does not require a remote service.
+    Provides the same interface as :class:`CacheClient` but stores cache
+    entries in process memory. Does not require a remote service.
+
+    .. note::
+       Review item #T23: ``session_id`` is accepted purely to keep the
+       constructor signature interchangeable with :class:`CacheClient`.
+       There is no access control on a local in-process dict, so the
+       value is stored on ``self`` for introspection but never consulted
+       when reading or writing entries. Code that relies on session
+       scoping for isolation must use the remote :class:`CacheClient`
+       against the cache service.
     """
 
     def __init__(self, session_id: Optional[str] = None):
+        # Stored only for parity with CacheClient — see class docstring.
         self.session_id = session_id
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._stats = {
@@ -287,7 +305,7 @@ class LocalCacheClient:
 
         # Check expiration
         expires_at = entry.get("expires_at")
-        if expires_at and datetime.fromisoformat(expires_at) < datetime.utcnow():
+        if expires_at and datetime.fromisoformat(expires_at) < _utcnow():
             self._stats["misses"] += 1
             del self._cache[cache_key]
             logger.debug(f"Local cache expired for key {cache_key[:16]}...")
@@ -324,7 +342,7 @@ class LocalCacheClient:
         expires_at = None
         if ttl_seconds is not None:
             expires_at = (
-                datetime.utcnow() + timedelta(seconds=ttl_seconds)
+                _utcnow() + timedelta(seconds=ttl_seconds)
             ).isoformat()
 
         self._cache[cache_key] = {
@@ -337,7 +355,7 @@ class LocalCacheClient:
             "run_db_path": run_db_path,
             "expires_at": expires_at,
             "metadata": metadata,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": _utcnow().isoformat(),
         }
 
         logger.info(f"Local cache set for key {cache_key[:16]}...")

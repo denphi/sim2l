@@ -45,9 +45,48 @@ cd web-ui
 npm install
 ```
 
-## Configuration
+## Deployment topology
 
-Create a `.env` file in the `web-ui` directory:
+The web-UI is a static SPA. It is **not** meant to talk to each
+microservice on a different origin from the browser — the bundled
+defaults assume a single origin where `/api/cache`, `/api/catalog`, and
+`/api/results` are reverse-proxied to the corresponding backend.
+
+```
+                       ┌───────────────────────────┐
+   browser  ────HTTPS──►   reverse proxy (nginx,   │
+                       │   Caddy, Vite dev server) │
+                       └──────┬───┬────────┬───────┘
+                              │   │        │
+                  /api/cache  │   │        │  /api/catalog
+                              ▼   ▼        ▼
+                       cache_service  catalog_service  results_service
+                       (8001)         (8002)           (8003)
+```
+
+In development, [`vite.config.ts`](./vite.config.ts) is the reverse
+proxy: requests to `/api/{cache,catalog,results}` from `npm run dev`
+(port 3000) are forwarded to the three Flask services on 8001/8002/8003.
+In production, **bring your own** reverse proxy with the three
+locations. Example nginx snippet:
+
+```nginx
+location /api/cache/   { proxy_pass http://127.0.0.1:8001/; }
+location /api/catalog/ { proxy_pass http://127.0.0.1:8002/; }
+location /api/results/ { proxy_pass http://127.0.0.1:8003/; }
+```
+
+The proxy is what lets login persist across services: the browser only
+ever sees the single front-door origin, so cookies and session-id
+storage (`localStorage`) Just Work. Pointing the SPA directly at the
+three service ports requires CORS configuration on every backend and is
+explicitly not supported.
+
+### Overrides
+
+The defaults can be overridden with a `.env` file when you really do
+need direct cross-origin access (e.g. local IDE development against a
+remote backend cluster):
 
 ```env
 VITE_CACHE_SERVICE_URL=http://localhost:8001
@@ -55,6 +94,9 @@ VITE_RESULTS_SERVICE_URL=http://localhost:8003
 VITE_CATALOG_SERVICE_URL=http://localhost:8002
 VITE_SESSION_ID=demo-session
 ```
+
+Setting these makes each axios client target the absolute URL — the
+backend services then need CORS allowing `http://localhost:3000`.
 
 ## Development
 

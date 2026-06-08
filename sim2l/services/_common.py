@@ -13,8 +13,11 @@ beginnings of a consolidated base; callers gradually migrate to it.
 
 from __future__ import annotations
 
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Deque, Dict, Iterable, Optional, Tuple
 
 
 # ── Time helpers ─────────────────────────────────────────────────────────────
@@ -28,6 +31,75 @@ def utcnow() -> datetime:
     UTC) behave correctly.
     """
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ── Login rate limiter ───────────────────────────────────────────────────────
+
+
+class LoginRateLimiter:
+    """In-process sliding-window limiter keyed by (ip, username).
+
+    Review item #T15: ``/session/login`` previously accepted unlimited
+    credential guesses. Adding a per-(ip, username) limiter takes the
+    online-brute-force vector off the table without needing an external
+    Redis. Configuration is intentionally generous (5 attempts / 60s) so
+    legitimate users hitting "Login" three times in quick succession
+    aren't locked out.
+
+    The limiter is process-local — services scaled horizontally would need
+    a shared store. That's a known limitation; the limiter is still useful
+    for single-process and single-replica deployments, which is what the
+    dev-loop targets.
+    """
+
+    def __init__(self, max_attempts: int = 5, window_seconds: float = 60.0):
+        self.max_attempts = max_attempts
+        self.window_seconds = float(window_seconds)
+        self._buckets: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def _key(self, ip: Optional[str], username: Optional[str]) -> Tuple[str, str]:
+        return (ip or "unknown", (username or "").lower())
+
+    def allow(self, ip: Optional[str], username: Optional[str]) -> bool:
+        """Return True when the request is under the limit, False otherwise.
+
+        Each call records a timestamp regardless of outcome — limiting on
+        attempt rate (rather than failures only) means a sustained guess
+        spree still gets rejected even if the attacker rotates usernames.
+        """
+        now = time.monotonic()
+        cutoff = now - self.window_seconds
+        key = self._key(ip, username)
+        with self._lock:
+            bucket = self._buckets[key]
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= self.max_attempts:
+                return False
+            bucket.append(now)
+            return True
+
+    def reset(self, ip: Optional[str] = None, username: Optional[str] = None) -> None:
+        """Clear a bucket — used by tests and on successful logins."""
+        with self._lock:
+            if ip is None and username is None:
+                self._buckets.clear()
+            else:
+                self._buckets.pop(self._key(ip, username), None)
+
+
+def client_ip(request) -> str:
+    """Best-effort client IP from a Flask request.
+
+    Prefers ``X-Forwarded-For`` (first hop) so deployments behind a known
+    reverse proxy get the real client; falls back to ``remote_addr``.
+    Operators who don't trust the header should strip it at the proxy.
+    """
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd:
+        return fwd.split(",", 1)[0].strip()
+    return request.remote_addr or "unknown"
 
 
 # ── Auth header parsing ──────────────────────────────────────────────────────

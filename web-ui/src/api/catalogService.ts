@@ -1,5 +1,6 @@
 // Catalog Service API Client
-import { apiClient } from './client';
+import { apiClient, serviceErrorMessage } from './client';
+import { getSessionId } from './session';
 import type {
   Simulation,
   ExecutionRecord,
@@ -16,12 +17,17 @@ export class CatalogServiceClient {
     return response.data;
   }
 
-  async searchSimulations(query: string = ''): Promise<{ simulations: Simulation[] } | Simulation[]> {
-    const response = await apiClient.catalog.get<Simulation[] | { simulations: Simulation[] }>(
-      '/simulations/search',
-      { params: { query } }
-    );
-    return response.data;
+  async searchSimulations(query: string = ''): Promise<Simulation[]> {
+    // The catalog `/simulations/search` endpoint returns a flat array
+    // (review item #W3). Some legacy mock servers responded with
+    // `{ simulations: [...] }`, so we normalise both shapes here rather
+    // than pushing the discriminator out to every caller.
+    const response = await apiClient.catalog.get<
+      Simulation[] | { simulations: Simulation[] }
+    >('/simulations/search', { params: { query } });
+    const data = response.data;
+    if (Array.isArray(data)) return data;
+    return data?.simulations ?? [];
   }
 
   async getSimulation(name: string, version?: string): Promise<Simulation> {
@@ -36,23 +42,31 @@ export class CatalogServiceClient {
     name?: string;
     version?: string;
   }> {
-    const response = await apiClient.catalog.delete<{
-      status?: string;
-      simulation_id?: number;
-      name?: string;
-      version?: string;
-    }>(`/simulations/${simulationId}`);
-    return {
-      status: response.data.status || 'deleted',
-      simulation_id: response.data.simulation_id || simulationId,
-      name: response.data.name,
-      version: response.data.version,
-    };
+    try {
+      const response = await apiClient.catalog.delete<{
+        status?: string;
+        simulation_id?: number;
+        name?: string;
+        version?: string;
+      }>(`/simulations/${simulationId}`);
+      return {
+        status: response.data.status || 'deleted',
+        simulation_id: response.data.simulation_id || simulationId,
+        name: response.data.name,
+        version: response.data.version,
+      };
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to delete simulation'));
+    }
   }
 
   async clearAllSimulations(): Promise<{ deleted: number }> {
-    const response = await apiClient.catalog.delete<{ deleted: number }>('/simulations');
-    return response.data;
+    try {
+      const response = await apiClient.catalog.delete<{ deleted: number }>('/simulations');
+      return response.data;
+    } catch (error) {
+      throw new Error(serviceErrorMessage(error, 'Failed to clear simulations'));
+    }
   }
 
   async getExecutionStats(simulationId: number): Promise<ExecutionStats> {
@@ -127,13 +141,18 @@ export class CatalogServiceClient {
 
   async submitRun(request: RunRequest): Promise<RunResponse> {
     try {
-      const response = await apiClient.catalog.post<RunResponse>('/run', request);
+      const response = await apiClient.catalog.post<RunResponse>('/run', request, {
+        headers: {
+          'X-Sim2L-Cache-Session-ID': getSessionId('cache'),
+          'X-Sim2L-Results-Session-ID': getSessionId('results'),
+        },
+      });
       return response.data;
     } catch (error: any) {
       console.error('Error submitting run:', error);
       return {
         success: false,
-        error: error.response?.data?.error || error.message || 'Failed to submit run',
+        error: serviceErrorMessage(error, 'Failed to submit run'),
       };
     }
   }

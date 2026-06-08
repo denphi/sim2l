@@ -4,6 +4,10 @@
 
 """JSON serialization utilities"""
 
+# Keep `X | None` annotations evaluatable on Python 3.9 — sim2l is imported by
+# arc inside the legacy-FEniCS/DOLFIN conda env, which ships py39-only builds.
+from __future__ import annotations
+
 import json
 import jsonpickle
 import numpy as np
@@ -147,29 +151,56 @@ class JsonDecoder:
         return obj
 
     @classmethod
+    def _decode_list(cls, items: list) -> list:
+        """Recurse into a list, handling nested dicts/lists symmetrically."""
+        result: list = []
+        for item in items:
+            if isinstance(item, dict):
+                result.append(cls.decode(cls.decode_dict(item)))
+            elif isinstance(item, list):
+                result.append(cls._decode_list(item))
+            else:
+                result.append(item)
+        return result
+
+    @classmethod
     def decode_dict(cls, data: dict) -> dict:
-        """Recursively decode a dictionary"""
+        """Recursively decode a dictionary.
+
+        Review item #S9: lists of lists now recurse into the inner list
+        rather than passing it through unchanged.
+        """
         result = {}
         for key, value in data.items():
             if isinstance(value, dict):
                 result[key] = cls.decode(cls.decode_dict(value))
             elif isinstance(value, list):
-                result[key] = [cls.decode(item) if isinstance(item, dict) else item for item in value]
+                result[key] = cls._decode_list(value)
             else:
                 result[key] = value
         return result
 
 
-def serialize_value(value: Any) -> str:
-    """Serialize a value to JSON string using custom encoder
+def serialize_value(value: Any, *, allow_pickle: bool = False) -> str:
+    """Serialize a value to JSON string using custom encoder.
 
     Args:
-        value: Value to serialize
+        value: Value to serialize.
+        allow_pickle: When True, the encoder falls back to ``jsonpickle`` for
+            objects it doesn't know how to handle. Off by default — the
+            decoded form embeds class names and is RCE-prone when fed back
+            through a class-aware decoder. Review item #S10.
 
     Returns:
         JSON string
     """
-    return json.dumps(value, cls=JsonEncoder, sort_keys=True)
+    encoder_cls = JsonEncoder
+    if allow_pickle:
+        class _PickleEncoder(JsonEncoder):
+            pass
+        _PickleEncoder.allow_pickle = True
+        encoder_cls = _PickleEncoder
+    return json.dumps(value, cls=encoder_cls, sort_keys=True)
 
 
 def deserialize_value(json_str: str) -> Any:

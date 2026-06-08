@@ -13,6 +13,17 @@ NC='\033[0m' # No Color
 
 echo -e "${BLUE}Starting sim2l services...${NC}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+else
+    PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+export SIM2L_CACHE_SERVICE_URL="${SIM2L_CACHE_SERVICE_URL:-${SIM2L_CACHE_URL:-http://localhost:8001}}"
+export SIM2L_CATALOG_SERVICE_URL="${SIM2L_CATALOG_SERVICE_URL:-${SIM2L_CATALOG_URL:-http://localhost:8002}}"
+export SIM2L_RESULTS_SERVICE_URL="${SIM2L_RESULTS_SERVICE_URL:-${SIM2L_RESULTS_URL:-http://localhost:8003}}"
+
 # Create necessary directories
 mkdir -p ~/.sim2l/runs
 mkdir -p ~/.sim2l/logs
@@ -26,7 +37,7 @@ sleep 2
 
 # Start Cache Service
 echo -e "${BLUE}Starting Cache Service on port 8001...${NC}"
-python3 -m sim2l.services.cache_service \
+nohup "$PYTHON_BIN" -m sim2l.services.cache_service \
     --backend sqlite \
     --db-path ~/.sim2l/cache.db \
     --no-auth \
@@ -34,13 +45,14 @@ python3 -m sim2l.services.cache_service \
     > ~/.sim2l/logs/cache.log 2>&1 &
 CACHE_PID=$!
 echo -e "${GREEN}Cache Service started (PID: $CACHE_PID)${NC}"
+disown "$CACHE_PID" 2>/dev/null || true
 
 # Wait a bit for service to start
 sleep 2
 
 # Start Catalog Service
 echo -e "${BLUE}Starting Catalog Service on port 8002...${NC}"
-python3 -m sim2l.services.catalog_service \
+nohup "$PYTHON_BIN" -m sim2l.services.catalog_service \
     --backend sqlite \
     --db-path ~/.sim2l/catalog.db \
     --no-auth \
@@ -48,13 +60,14 @@ python3 -m sim2l.services.catalog_service \
     > ~/.sim2l/logs/catalog.log 2>&1 &
 CATALOG_PID=$!
 echo -e "${GREEN}Catalog Service started (PID: $CATALOG_PID)${NC}"
+disown "$CATALOG_PID" 2>/dev/null || true
 
 # Wait a bit for service to start
 sleep 2
 
 # Start Results Service
 echo -e "${BLUE}Starting Results Service on port 8003...${NC}"
-python3 -m sim2l.services.results_service \
+nohup "$PYTHON_BIN" -m sim2l.services.results_service \
     --backend sqlite \
     --db-path ~/.sim2l/results.db \
     --no-auth \
@@ -62,6 +75,7 @@ python3 -m sim2l.services.results_service \
     > ~/.sim2l/logs/results.log 2>&1 &
 RESULTS_PID=$!
 echo -e "${GREEN}Results Service started (PID: $RESULTS_PID)${NC}"
+disown "$RESULTS_PID" 2>/dev/null || true
 
 # Wait for all services to be ready
 echo -e "${BLUE}Waiting for services to be ready...${NC}"

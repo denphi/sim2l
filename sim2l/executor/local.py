@@ -6,7 +6,7 @@
 
 import uuid
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 import sqlite3
 
@@ -16,6 +16,11 @@ from ..definition.function_workflow import function_from_source
 from ..result import ExecutionResult
 from ..utils import compute_squid_id, compute_cache_key
 from ..config import get_config, get_logger
+
+
+def _utcnow_iso() -> str:
+    """Naive-UTC ISO timestamp (matches the rest of sim2l). Review #S5."""
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 logger = get_logger()
 
@@ -99,29 +104,42 @@ class LocalExecutor(Executor):
             return None
 
     def _check_cache_local(self, cache_key: str) -> Optional[ExecutionResult]:
-        """Look up a cached result via the legacy in-DB cache table."""
+        """Look up a cached result via the legacy in-DB cache table.
+
+        Wraps the SELECT-then-UPDATE pair in a single ``BEGIN IMMEDIATE``
+        transaction so two concurrent lookups don't see the same row and
+        both bump the access counter inconsistently. Mirrors the service-
+        side fix from review item #3, applied here for #S6. Timestamps now
+        use naive-UTC to match the service tables (#S5).
+        """
         db_path = get_config().db_path
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                "SELECT execution_id FROM cache WHERE cache_key = ?",
-                (cache_key,),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return None
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(
+                    "SELECT execution_id FROM cache WHERE cache_key = ?",
+                    (cache_key,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
 
-            execution_id = row[0]
-            cursor.execute(
-                """
-                UPDATE cache
-                SET last_accessed = ?, access_count = access_count + 1
-                WHERE cache_key = ?
-                """,
-                (datetime.now().isoformat(), cache_key),
-            )
-            conn.commit()
+                execution_id = row[0]
+                cursor.execute(
+                    """
+                    UPDATE cache
+                    SET last_accessed = ?, access_count = access_count + 1
+                    WHERE cache_key = ?
+                    """,
+                    (_utcnow_iso(), cache_key),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
             from ..result import load_result
             result = load_result(execution_id)
@@ -295,7 +313,7 @@ class LocalExecutor(Executor):
                     (
                         result.cache_key,
                         result.execution_id,
-                        datetime.now().isoformat(),
+                        _utcnow_iso(),
                         result.cache_key,
                     ),
                 )

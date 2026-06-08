@@ -363,6 +363,14 @@ class TestSessionManagerPrivilegeChecking:
             self.admin_session.session_id, "catalog_update"
         )
 
+    def test_check_privilege_run(self):
+        """Developer and admin sessions can execute catalog runs."""
+        assert not self.manager.check_privilege(self.user_session.session_id, "run")
+        assert self.manager.check_privilege(self.dev_session.session_id, "run")
+        assert self.manager.check_privilege(self.admin_session.session_id, "run")
+        assert self.manager.check_privilege(self.dev_session.session_id, "execute")
+        assert self.manager.check_privilege(self.admin_session.session_id, "execute")
+
     def test_check_privilege_admin(self):
         """Test checking admin privilege."""
         assert not self.manager.check_privilege(self.user_session.session_id, "admin")

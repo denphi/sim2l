@@ -32,6 +32,7 @@ import {
 } from '@mui/icons-material';
 import { cacheService } from '../api/cacheService';
 import type { CacheEntry, CacheStats } from '../types/cache';
+import { ConfirmDestructiveDialog } from '../components/common/ConfirmDestructiveDialog';
 
 export function Cache() {
   const [entries, setEntries] = useState<CacheEntry[]>([]);
@@ -44,6 +45,8 @@ export function Cache() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'valid' | 'invalidated'>('all');
   const [deletingCacheKey, setDeletingCacheKey] = useState<string | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [clearAllOpen, setClearAllOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<CacheEntry | null>(null);
 
   useEffect(() => {
     loadData();
@@ -86,36 +89,20 @@ export function Cache() {
     loadData();
   };
 
-  const handleClearAll = async () => {
-    const confirmed = window.confirm(
-      `Delete ALL cache entries? This cannot be undone.`
-    );
-    if (!confirmed) return;
-    try {
-      const result = await cacheService.clearAllEntries();
-      window.alert(`Cleared ${result.deleted} cache entry(ies).`);
-      await loadData();
-    } catch (error) {
-      console.error('Failed to clear cache:', error);
-      window.alert('Failed to clear cache. See browser console for details.');
-    }
+  // Review item #T5: replaced window.confirm with the type-to-confirm dialog
+  // so accidental double-Enter can't wipe the cache table.
+  const performClearAll = async () => {
+    const result = await cacheService.clearAllEntries();
+    await loadData();
+    // Surfacing the count is helpful but non-blocking; keep the alert.
+    window.alert(`Cleared ${result.deleted} cache entry(ies).`);
   };
 
-  const handleDeleteEntry = async (entry: CacheEntry) => {
-    const confirmed = window.confirm(
-      `Delete cache entry "${entry.cache_key}" for ${entry.simulation_name}/${entry.simulation_version}?`
-    );
-    if (!confirmed) {
-      return;
-    }
-
+  const performDeleteEntry = async (entry: CacheEntry) => {
     setDeletingCacheKey(entry.cache_key);
     try {
       await cacheService.deleteEntry(entry.cache_key);
       await loadData();
-    } catch (error) {
-      console.error('Failed to delete cache entry:', error);
-      window.alert('Failed to delete cache entry. See browser console for details.');
     } finally {
       setDeletingCacheKey(null);
     }
@@ -175,7 +162,7 @@ export function Cache() {
             variant="outlined"
             color="error"
             size="small"
-            onClick={handleClearAll}
+            onClick={() => setClearAllOpen(true)}
           >
             Clear All
           </Button>
@@ -362,7 +349,7 @@ export function Cache() {
                                 <IconButton
                                   color="error"
                                   size="small"
-                                  onClick={() => handleDeleteEntry(entry)}
+                                  onClick={() => setPendingDelete(entry)}
                                   disabled={deletingCacheKey === entry.cache_key}
                                 >
                                   <DeleteIcon fontSize="small" />
@@ -458,6 +445,31 @@ export function Cache() {
           onRowsPerPageChange={handleChangeRowsPerPage}
         />
       </Paper>
+
+      <ConfirmDestructiveDialog
+        open={clearAllOpen}
+        title="Clear all cache entries"
+        description="This permanently deletes every cache entry across all simulations and cannot be undone."
+        confirmPhrase="DELETE ALL"
+        confirmLabel="Clear all"
+        onConfirm={performClearAll}
+        onClose={() => setClearAllOpen(false)}
+      />
+      <ConfirmDestructiveDialog
+        open={pendingDelete !== null}
+        title="Delete cache entry"
+        description={
+          pendingDelete
+            ? `Delete cache entry "${pendingDelete.cache_key}" for ${pendingDelete.simulation_name}/${pendingDelete.simulation_version}? This cannot be undone.`
+            : ''
+        }
+        confirmPhrase="DELETE"
+        confirmLabel="Delete entry"
+        onConfirm={async () => {
+          if (pendingDelete) await performDeleteEntry(pendingDelete);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </Container>
   );
 }

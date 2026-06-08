@@ -76,6 +76,10 @@ export function SubmitRunModal({ open, onClose, simulationName, simulationVersio
             parsedValue = value === '' ? '' : Number(value);
         }
         setParams(prev => ({ ...prev, [key]: parsedValue }));
+        // Review item #T12: clear any previous submit error as soon as the
+        // user edits the form, so the Submit button isn't permanently
+        // disabled after the first failure.
+        if (error) setError(null);
     };
 
     const handleSubmit = async () => {
@@ -122,10 +126,12 @@ export function SubmitRunModal({ open, onClose, simulationName, simulationVersio
                     <Box display="flex" justifyContent="center" p={3}>
                         <CircularProgress />
                     </Box>
-                ) : error ? (
-                    <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>
                 ) : simulation ? (
                     <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                        {/* Review item #T12: show errors inline above the form
+                            instead of replacing it, so the user can correct
+                            inputs and resubmit without dismissing the modal. */}
+                        {error && <Alert severity="error">{error}</Alert>}
                         <Typography variant="body2" color="textSecondary" gutterBottom>
                             {simulation.description}
                         </Typography>
@@ -148,6 +154,9 @@ export function SubmitRunModal({ open, onClose, simulationName, simulationVersio
                             </Typography>
                         )}
                     </Box>
+                ) : error ? (
+                    // Loading the simulation itself failed — no form to show.
+                    <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>
                 ) : null}
             </DialogContent>
             <DialogActions>
@@ -156,7 +165,7 @@ export function SubmitRunModal({ open, onClose, simulationName, simulationVersio
                     onClick={handleSubmit}
                     variant="contained"
                     color="primary"
-                    disabled={loading || submitting || !!error || !simulation}
+                    disabled={loading || submitting || !simulation}
                 >
                     {submitting ? <CircularProgress size={24} /> : 'Submit Run'}
                 </Button>

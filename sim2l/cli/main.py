@@ -6,6 +6,7 @@
 
 import click
 
+from .mcp import mcp
 from .services import services
 
 
@@ -16,6 +17,7 @@ def cli():
 
 
 cli.add_command(services)
+cli.add_command(mcp)
 
 
 if __name__ == "__main__":
