@@ -74,6 +74,11 @@ class ExecutionResult:
         self.error_message = error_message
         self.cache_key = cache_key
         self.squid_id = squid_id
+        # Runtime-only flag: True when this result was returned from a cache
+        # lookup instead of a fresh execution. Set by the executors'
+        # check_cache paths; never persisted (a stored result is the original
+        # execution — being served from cache is a property of the *request*).
+        self.cache_hit = False
 
         # Create OutputData
         if outputs is not None:
@@ -332,3 +337,82 @@ def load_result(execution_id: str, db_path: Optional[Path] = None) -> ExecutionR
         ExecutionResult
     """
     return ExecutionResult.load(execution_id, db_path)
+
+
+def load_result_with_fallback(
+    execution_id: str, db_path: Optional[Path] = None
+) -> ExecutionResult:
+    """Load a result locally, falling back to the results service.
+
+    Cross-installation cache hits point at executions that ran *elsewhere* —
+    the local database has no row, so a plain :func:`load_result` raises and
+    the cache hit degrades to a miss. When ``results_service_url`` is
+    configured, fetch the stored input/output params from the results
+    service and reconstruct a result instead, making shared-cache hits work
+    across installations.
+
+    Raises the original local-load error when no service is configured or
+    the service doesn't have the execution either.
+    """
+    try:
+        return load_result(execution_id, db_path)
+    except Exception as local_exc:
+        from ..config import get_config
+
+        config = get_config()
+        url = getattr(config, "results_service_url", None)
+        if not url:
+            raise
+        try:
+            from ..database.results_client import ResultsClient
+
+            client = ResultsClient(
+                base_url=url,
+                session_id=getattr(config, "results_session_id", None),
+            )
+            data = client.get_result(execution_id)
+        except Exception:
+            raise local_exc
+        if not data:
+            raise local_exc
+        return _result_from_service_row(execution_id, data)
+
+
+def _service_value_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, str):
+        return "Text"
+    if isinstance(value, (list, tuple)):
+        return "Array"
+    if isinstance(value, dict):
+        return "Dict"
+    return "Number"
+
+
+def _result_from_service_row(execution_id: str, data: dict) -> ExecutionResult:
+    """Reconstruct an ExecutionResult from a results-service row.
+
+    The service stores input/output params but not the schema object, so
+    the output schema is inferred from the stored values — sufficient for
+    cache consumers, which read outputs by attribute.
+    """
+    from ..schema import OutputSchema
+
+    output_params = data.get("output_params") or {}
+    out_schema = OutputSchema.from_dict(
+        {k: {"type": _service_value_type(v)} for k, v in output_params.items()}
+    )
+    return ExecutionResult(
+        execution_id=execution_id,
+        simulation_id=-1,  # not local — the service row has name/version only
+        simulation_name=data.get("simulation_name") or "",
+        simulation_version=data.get("simulation_version") or "",
+        inputs=data.get("input_params") or {},
+        output_schema=out_schema,
+        output_data=output_params,
+        status=data.get("status") or "completed",
+        duration_seconds=data.get("duration_seconds"),
+        executor_type="results-service",
+        squid_id=data.get("squid_id"),
+    )

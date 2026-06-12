@@ -4,8 +4,7 @@ Install the optional MCP dependency before running this module:
 
     pip install "sim2l[mcp]"
 
-The server is intentionally sim2l-owned. ARC and other agents consume these
-tools through MCP; ARC-specific workflow control remains in ARC.
+The server exposes sim2l service capabilities to MCP-compatible clients.
 """
 
 from __future__ import annotations

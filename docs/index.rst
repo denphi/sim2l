@@ -19,6 +19,7 @@ Contents
    :caption: User Guide
 
    usage
+   mcp
    database_services
    file_management
    examples
@@ -68,6 +69,7 @@ Key Capabilities
 * **Distributed Caching** - Share results across team members
 * **Tool Discovery** - Searchable catalog of all simulations
 * **Parameter Search** - Find runs by input/output values
+* **MCP Tools** - Discover, run, and inspect simulations from MCP-compatible clients
 * **File Export** - Easy access to generated files
 * **Session-Based Auth** - Secure access to all services
 

@@ -46,6 +46,7 @@ https://sim2l.readthedocs.io
 
 - `index.rst` - Main index with navigation
 - `quickstart.rst` - Quick start guide
+- `mcp.rst` - MCP server installation, tools, authentication, and configuration
 - `database_services.rst` - Complete database services documentation
 - `file_management.rst` - File management guide
 - `examples.rst` - Code examples

@@ -1,24 +1,9 @@
 Results Service
 ===============
 
-MCP Access
-----------
-
-sim2l owns the MCP server because it exposes sim2l capabilities to agents.
-ARC should consume these tools as an MCP client rather than exposing ARC
-workflow controls from sim2l.
-
-Install the optional dependency and start the MCP server with::
-
-   pip install "sim2l[mcp]"
-   sim2l mcp serve --transport stdio
-
-The server exposes tool calls for logging in to sim2l services, searching the
-catalog, running registered simulations, and listing/searching results. Login
-exchanges username/password for per-service tokens held by the MCP server
-process; later tool calls forward those tokens to the existing REST services.
-
 Introspects simulation results and stores them in a searchable database. Modern replacement for ``registerSquidpgSimtool``.
+
+Execution results are also available through the :doc:`../mcp` integration.
 
 Quick Start
 -----------

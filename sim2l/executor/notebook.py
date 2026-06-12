@@ -111,7 +111,13 @@ class NotebookExecutor(Executor):
             config = get_config()
 
             logger.debug(f"Checking cache service for key: {cache_key}")
-            cache_client = CacheClient(service_url=config.cache_service_url)
+            # Pass the cache session id (like the local/isolated executors)
+            # so a require_auth cache service accepts the lookup instead of
+            # turning every notebook run into a silent permanent miss.
+            cache_client = CacheClient(
+                service_url=config.cache_service_url,
+                session_id=getattr(config, "cache_session_id", None),
+            )
             cached_data = cache_client.get(cache_key)
 
             if cached_data is None:
@@ -122,9 +128,12 @@ class NotebookExecutor(Executor):
             # Load execution result from cached data
             execution_id = cached_data.get('execution_id')
             if execution_id:
-                from ..result import load_result
+                # Fallback loader: a hit produced on *another* installation
+                # has no local DB row — reconstruct from the results service.
+                from ..result import load_result_with_fallback
                 logger.debug(f"Loading cached result from execution: {execution_id}")
-                result = load_result(execution_id)
+                result = load_result_with_fallback(execution_id)
+                result.cache_hit = True
                 logger.info(f"CACHED. Fetching results from execution {execution_id[:8]}...")
                 return result
 
@@ -165,6 +174,7 @@ class NotebookExecutor(Executor):
             # Load execution result
             from ..result import load_result
             result = load_result(execution_id)
+            result.cache_hit = True
 
             logger.info(f"CACHED. Fetching results from execution {execution_id[:8]}...")
 
@@ -414,7 +424,10 @@ class NotebookExecutor(Executor):
             import numpy as np
             config = get_config()
 
-            cache_client = CacheClient(service_url=config.cache_service_url)
+            cache_client = CacheClient(
+                service_url=config.cache_service_url,
+                session_id=getattr(config, "cache_session_id", None),
+            )
 
             # Convert inputs to JSON-serializable format (extract magnitudes from Pint Quantities)
             serializable_inputs = {}

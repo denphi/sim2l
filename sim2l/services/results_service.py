@@ -114,6 +114,23 @@ class ResultsBackend:
         """Record an error during result registration."""
         raise NotImplementedError
 
+    def record_provenance(
+        self, session_id: str, entries: List[Dict[str, Any]]
+    ) -> int:
+        """Append agent-action provenance entries for a research session.
+
+        Clients (e.g. arc) publish their local provenance log here so the
+        audit trail of *how* a result was produced outlives the client
+        machine. Returns the number of entries stored.
+        """
+        raise NotImplementedError
+
+    def get_provenance(
+        self, session_id: str, limit: int = 1000
+    ) -> List[Dict[str, Any]]:
+        """Return the stored provenance entries for a session, oldest first."""
+        raise NotImplementedError
+
 
 class SQLiteResultsBackend(ResultsBackend):
     """SQLite implementation of results storage.
@@ -221,6 +238,23 @@ class SQLiteResultsBackend(ResultsBackend):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Provenance log: agent-action audit trails published by research
+        # clients (arc), keyed by the client's research session id.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS provenance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT,
+                action TEXT,
+                agent TEXT,
+                artifact_id TEXT,
+                run_id TEXT,
+                entry TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_provenance_session ON provenance_log(session_id)")
 
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_exec_results_exec_id ON execution_results(execution_id)")
@@ -611,6 +645,52 @@ class SQLiteResultsBackend(ResultsBackend):
 
         conn.commit()
 
+    def record_provenance(
+        self, session_id: str, entries: List[Dict[str, Any]]
+    ) -> int:
+        import json
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        rows = [
+            (
+                session_id,
+                str(e.get("timestamp") or ""),
+                str(e.get("action") or ""),
+                str(e.get("agent") or ""),
+                e.get("artifact_id"),
+                e.get("run_id"),
+                json.dumps(e, default=str),
+            )
+            for e in entries if isinstance(e, dict)
+        ]
+        if rows:
+            cursor.executemany("""
+                INSERT INTO provenance_log (
+                    session_id, timestamp, action, agent,
+                    artifact_id, run_id, entry
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+            conn.commit()
+        return len(rows)
+
+    def get_provenance(
+        self, session_id: str, limit: int = 1000
+    ) -> List[Dict[str, Any]]:
+        import json
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT entry FROM provenance_log
+            WHERE session_id = ? ORDER BY id LIMIT ?
+        """, (session_id, int(limit)))
+        out = []
+        for row in cursor.fetchall():
+            try:
+                out.append(json.loads(row["entry"]))
+            except (TypeError, ValueError):
+                pass
+        return out
+
 
 class PostgreSQLResultsBackend(ResultsBackend):
     """PostgreSQL implementation using the results_db_schema.sql schema.
@@ -896,6 +976,78 @@ class PostgreSQLResultsBackend(ResultsBackend):
               error_type, error_message, stack_trace))
 
         conn.commit()
+
+    def _ensure_provenance_table(self):
+        """Create the provenance table if this PG database predates it.
+
+        ``_initialize_schema`` skips the schema file when the core tables
+        already exist, so an upgraded deployment needs the table created
+        here (idempotent, run once per process).
+        """
+        if getattr(self, "_provenance_ready", False):
+            return
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS provenance_log (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                timestamp TEXT,
+                action TEXT,
+                agent TEXT,
+                artifact_id TEXT,
+                run_id TEXT,
+                entry JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_provenance_session "
+            "ON provenance_log(session_id)"
+        )
+        conn.commit()
+        self._provenance_ready = True
+
+    def record_provenance(
+        self, session_id: str, entries: List[Dict[str, Any]]
+    ) -> int:
+        import json
+        self._ensure_provenance_table()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        rows = [
+            (
+                session_id,
+                str(e.get("timestamp") or ""),
+                str(e.get("action") or ""),
+                str(e.get("agent") or ""),
+                e.get("artifact_id"),
+                e.get("run_id"),
+                json.dumps(e, default=str),
+            )
+            for e in entries if isinstance(e, dict)
+        ]
+        if rows:
+            cursor.executemany("""
+                INSERT INTO provenance_log (
+                    session_id, timestamp, action, agent,
+                    artifact_id, run_id, entry
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+            """, rows)
+            conn.commit()
+        return len(rows)
+
+    def get_provenance(
+        self, session_id: str, limit: int = 1000
+    ) -> List[Dict[str, Any]]:
+        self._ensure_provenance_table()
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT entry FROM provenance_log
+            WHERE session_id = %s ORDER BY id LIMIT %s
+        """, (session_id, int(limit)))
+        return [row["entry"] for row in cursor.fetchall()]
 
 
 # ============================================================================
@@ -1281,6 +1433,55 @@ def create_results_service(
             'results': results,
             'count': len(results)
         })
+
+    @app.route('/provenance', methods=['POST'])
+    def record_provenance():
+        """Store agent-action provenance entries for a research session.
+
+        Body: ``{"session_id": "<research session>", "entries": [...]}``.
+        ``session_id`` here is the *client's research session* (e.g. an arc
+        chat session), distinct from the X-Session-ID auth header.
+        """
+        auth_result = check_session()
+        if isinstance(auth_result, tuple):
+            return auth_result
+
+        data = request.json or {}
+        research_session = data.get('session_id')
+        entries = data.get('entries')
+        if not research_session or not isinstance(entries, list):
+            return jsonify({'error': 'session_id and entries[] are required'}), 400
+        if len(entries) > 5000:
+            return jsonify({'error': 'too many entries (max 5000 per request)'}), 400
+
+        try:
+            count = results_backend.record_provenance(str(research_session), entries)
+            return jsonify({'status': 'recorded', 'count': count}), 201
+        except Exception:
+            logger.exception("Provenance record failed")
+            return jsonify({'error': 'Internal server error'}), 500
+
+    @app.route('/provenance/<research_session>', methods=['GET'])
+    def get_provenance(research_session):
+        """Return the stored provenance entries for a research session."""
+        auth_result = check_session()
+        if isinstance(auth_result, tuple):
+            return auth_result
+
+        try:
+            limit = max(1, min(int(request.args.get('limit', 1000)), 10000))
+        except (TypeError, ValueError):
+            limit = 1000
+        try:
+            entries = results_backend.get_provenance(research_session, limit=limit)
+            return jsonify({
+                'session_id': research_session,
+                'count': len(entries),
+                'entries': entries,
+            })
+        except Exception:
+            logger.exception("Provenance fetch failed")
+            return jsonify({'error': 'Internal server error'}), 500
 
     @app.route('/results/<path:execution_id>', methods=['GET'])
     def get_result(execution_id):

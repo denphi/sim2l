@@ -95,8 +95,11 @@ class LocalExecutor(Executor):
                 logger.warning(f"Cache hit missing execution_id: {cached_data}")
                 return None
 
-            from ..result import load_result
-            result = load_result(execution_id)
+            # Fallback loader: a hit produced on *another* installation has
+            # no local DB row — reconstruct it from the results service.
+            from ..result import load_result_with_fallback
+            result = load_result_with_fallback(execution_id)
+            result.cache_hit = True
             logger.info(f"CACHED. Fetching results from execution {execution_id[:8]}...")
             return result
         except Exception as exc:
@@ -143,6 +146,7 @@ class LocalExecutor(Executor):
 
             from ..result import load_result
             result = load_result(execution_id)
+            result.cache_hit = True
             logger.info(f"CACHED. Fetching results from execution {execution_id[:8]}...")
             return result
         finally:

@@ -11,6 +11,7 @@ sim2l is a modular, notebook-agnostic library for defining, deploying, and execu
 - **Pluggable executors**: Local, notebook (Papermill), HUB submit, and extensible
 - **Smart caching**: Automatic result caching based on inputs
 - **Full provenance**: Track all executions with complete metadata
+- **MCP integration**: Expose simulation discovery, execution, and results as MCP tools
 
 ## Quick Start
 
@@ -68,6 +69,21 @@ print(f"Current: {result.outputs.current}")
 See the `docs/` directory for:
 - [Architecture](docs/sim2l_architecture.md)
 - [Quick Reference](docs/sim2l_quick_reference.md)
+- [MCP Integration](docs/mcp.rst)
+
+## MCP Server
+
+Install the optional dependency and start the MCP server for an MCP-compatible
+client:
+
+```bash
+pip install "sim2l[mcp]"
+sim2l mcp serve --transport stdio
+```
+
+The server connects to the running cache, catalog, and results services. See the
+[MCP integration guide](docs/mcp.rst) for its tools, service URL configuration,
+authentication behavior, and deployment guidance.
 
 ## License
 

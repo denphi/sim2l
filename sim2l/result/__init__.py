@@ -4,11 +4,12 @@
 
 """Result management module"""
 
-from .result import ExecutionResult, load_result
+from .result import ExecutionResult, load_result, load_result_with_fallback
 from .outputs import OutputData
 
 __all__ = [
     "ExecutionResult",
     "OutputData",
     "load_result",
+    "load_result_with_fallback",
 ]

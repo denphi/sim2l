@@ -59,15 +59,18 @@ def test_check_cache_hits_cache_service_when_configured(monkeypatch):
     import sim2l.database as db_mod
     monkeypatch.setattr(db_mod, "CacheClient", lambda **kw: cache_client)
 
-    # load_result must return a sentinel
+    # the (fallback-capable) loader must return a sentinel
     fake_result = SimpleNamespace(execution_id="exec-abc")
     import sim2l.result as result_mod
-    monkeypatch.setattr(result_mod, "load_result", lambda eid: fake_result)
+    monkeypatch.setattr(result_mod, "load_result_with_fallback", lambda eid: fake_result)
 
     ex = IsolatedFunctionExecutor(cache=True)
     out = ex.check_cache(_StubSim(), {"x": 1})
     assert out is fake_result
     cache_client.get.assert_called_once()
+    # The returned result is stamped so consumers (arc adapter, registries)
+    # can distinguish a cache hit from a fresh execution.
+    assert out.cache_hit is True
 
 
 def test_check_cache_treats_lookup_failure_as_miss(monkeypatch):

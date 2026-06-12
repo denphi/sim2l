@@ -448,7 +448,7 @@ class CatalogServiceBackend:
         """
         raise NotImplementedError
 
-    def record_execution(self, data):
+    def record_execution(self, data, session_id=None):
         raise NotImplementedError
 
     def get_stats(self, simulation_id):
@@ -978,11 +978,26 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         logger.info("Cleared %d simulation(s)", deleted)
         return {"status": "cleared", "deleted": deleted}, 200
 
-    def record_execution(self, data):
+    def record_execution(self, data, session_id=None):
         import json
         conn = self._get_conn()
         cursor = conn.cursor()
 
+        # Attribute the execution to the authenticated session's user when
+        # the client did not supply one — executions should be auditable to
+        # a user, not anonymous by default.
+        user_id = data.get("user_id")
+        if user_id is None and session_id and not (self.no_auth and session_id == "no-auth-session"):
+            cursor.execute(
+                "SELECT user_id FROM sessions WHERE session_id = ?", (session_id,)
+            )
+            user_row = cursor.fetchone()
+            user_id = user_row["user_id"] if user_row else None
+
+        # Upsert on execution_id: a re-publish of the same execution (retry,
+        # idempotent client) updates the row instead of failing the UNIQUE
+        # constraint with a 500. Cache hits must be recorded under a fresh
+        # execution_id by the client so they never collide with the original.
         cursor.execute(
             """
             INSERT INTO execution_registry (
@@ -992,12 +1007,24 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
                 input_hash, output_count, artifact_count,
                 error_count, warning_count, environment
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(execution_id) DO UPDATE SET
+                completed_at = excluded.completed_at,
+                duration_seconds = excluded.duration_seconds,
+                status = excluded.status,
+                cache_hit = excluded.cache_hit,
+                run_db_path = excluded.run_db_path,
+                run_db_size_bytes = excluded.run_db_size_bytes,
+                output_count = excluded.output_count,
+                artifact_count = excluded.artifact_count,
+                error_count = excluded.error_count,
+                warning_count = excluded.warning_count,
+                environment = excluded.environment
             """,
             (
                 data["execution_id"],
                 data["squid_id"],
                 data["simulation_id"],
-                data.get("user_id"),
+                user_id,
                 data["started_at"],
                 data.get("completed_at"),
                 data.get("duration_seconds"),
@@ -1688,9 +1715,19 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         logger.info("Cleared %d simulation(s)", deleted)
         return {"status": "cleared", "deleted": deleted}, 200
 
-    def record_execution(self, data):
+    def record_execution(self, data, session_id=None):
         conn = self._get_conn()
         cursor = conn.cursor()
+
+        # Attribute the execution to the authenticated session's user when
+        # the client did not supply one (mirrors the SQLite backend).
+        user_id = data.get("user_id")
+        if user_id is None and session_id and not (self.no_auth and session_id == "no-auth-session"):
+            cursor.execute(
+                "SELECT user_id FROM sessions WHERE session_id = %s", (session_id,)
+            )
+            user_row = cursor.fetchone()
+            user_id = user_row["user_id"] if user_row else None
 
         cursor.execute(
             """
@@ -1701,12 +1738,24 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
                 input_hash, output_count, artifact_count,
                 error_count, warning_count, environment
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (execution_id) DO UPDATE SET
+                completed_at = EXCLUDED.completed_at,
+                duration_seconds = EXCLUDED.duration_seconds,
+                status = EXCLUDED.status,
+                cache_hit = EXCLUDED.cache_hit,
+                run_db_path = EXCLUDED.run_db_path,
+                run_db_size_bytes = EXCLUDED.run_db_size_bytes,
+                output_count = EXCLUDED.output_count,
+                artifact_count = EXCLUDED.artifact_count,
+                error_count = EXCLUDED.error_count,
+                warning_count = EXCLUDED.warning_count,
+                environment = EXCLUDED.environment
             """,
             (
                 data["execution_id"],
                 data["squid_id"],
                 data["simulation_id"],
-                data.get("user_id"),
+                user_id,
                 data["started_at"],
                 data.get("completed_at"),
                 data.get("duration_seconds"),
@@ -2073,7 +2122,7 @@ def record_execution():
             return jsonify(auth_result), auth_status
 
     data = request.json
-    result, status = catalog_db.record_execution(data)
+    result, status = catalog_db.record_execution(data, session_id=session_id)
     return jsonify(result), status
 
 

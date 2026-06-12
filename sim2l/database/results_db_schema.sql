@@ -409,6 +409,28 @@ FOR EACH ROW
 EXECUTE FUNCTION update_schema_timestamp();
 
 -- ============================================================================
+-- TABLE: provenance_log
+-- Agent-action audit trails published by research clients (e.g. arc),
+-- keyed by the client's research session id.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS provenance_log (
+    id SERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    timestamp TEXT,
+    action TEXT,
+    agent TEXT,
+    artifact_id TEXT,
+    run_id TEXT,
+    entry JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_provenance_session ON provenance_log(session_id);
+
+COMMENT ON TABLE provenance_log IS 'Published agent-action provenance for research sessions';
+
+-- ============================================================================
 -- INITIAL DATA
 -- ============================================================================
 
