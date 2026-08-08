@@ -24,8 +24,9 @@ What it does NOT buy you:
   privileges as the parent. A malicious workflow can read ``~/.ssh``, exfil
   data over the network, kill arbitrary processes the parent can kill, etc.
 * No protection against forking children that survive the parent's timeout
-  unless callers explicitly kill the worker's process group (see review
-  item #S1 — fixed by ``start_new_session=True``).
+  unless callers explicitly kill the worker's process group (review item #S1 —
+  the worker is started with ``start_new_session=True`` and the timeout path
+  signals the whole group).
 
 The right tool for *code sandboxing* is something like nsjail, gVisor, or a
 container with a seccomp profile. This executor is the appropriate boundary
@@ -294,19 +295,19 @@ class IsolatedFunctionExecutor(Executor):
                 encoding="utf-8",
             )
 
-            # Build the preexec_fn so the child becomes a new process group
-            # leader on POSIX. That gives us a kill target that covers any
-            # descendants the workflow may spawn (review item #S1).
-            limit_resources = self._limit_resources()
-
-            def _setup_child():
-                if os.name == "posix":
-                    try:
-                        os.setsid()
-                    except OSError:
-                        pass
-                if limit_resources is not None:
-                    limit_resources()
+            # The child becomes a new process-group leader so the timeout path
+            # has a kill target covering any descendants the workflow spawned
+            # (review item #S1). ``start_new_session=True`` is how to ask for
+            # that: it runs setsid() in C between fork and exec.
+            #
+            # This used to go through ``preexec_fn``, which CPython documents as
+            # unsafe in the presence of threads — arbitrary Python runs in the
+            # forked child while other threads may hold locks, and it can
+            # deadlock. These executors are called from the Flask services,
+            # which run threaded. ``preexec_fn`` is now used only when a memory
+            # cap is actually configured, since RLIMIT_AS has no native
+            # equivalent; the default path avoids it entirely.
+            limit_resources = self._limit_resources() if os.name == "posix" else None
 
             proc = subprocess.Popen(
                 [
@@ -321,7 +322,8 @@ class IsolatedFunctionExecutor(Executor):
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=_setup_child if os.name == "posix" else None,
+                start_new_session=(os.name == "posix"),
+                preexec_fn=limit_resources,
             )
             try:
                 stdout, stderr = proc.communicate(timeout=self.timeout_seconds)

@@ -23,6 +23,7 @@ from sim2l.services._common import (
     adapt_postgres_schema_for_sqlite as _adapt_postgres_schema_for_sqlite,
     client_ip as _client_ip,
     extract_session_id as _extract_session_id,
+    serve_app,
     utcnow as _utcnow,
 )
 
@@ -167,6 +168,32 @@ class SQLiteCacheBackend(CacheServiceBackend):
             WHERE session_id = ?
             AND is_valid = 1
             AND expires_at > datetime('now')
+            """,
+            (session_id,),
+        )
+        return cursor.fetchone() is not None
+
+    def _check_write_session(self, session_id: str) -> bool:
+        """Check the session has write/admin access, not merely that it exists.
+
+        Mirrors ``PostgreSQLCacheBackend._check_write_session``. Its absence here
+        meant the same endpoint enforced different authorization depending on
+        which backend the service was started with: on PostgreSQL, destructive
+        cache operations required write/admin; on SQLite — the default in
+        ``start_services.sh`` and the Docker images — any valid session passed,
+        so a ``role="user"`` account holding only ``["read", "write"]``
+        privileges could clear the entire cache. The ``access_level`` column was
+        already in the SQLite schema; nothing consulted it.
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 1 FROM cache_sessions
+            WHERE session_id = ?
+            AND is_valid = 1
+            AND expires_at > datetime('now')
+            AND access_level IN ('write', 'admin')
             """,
             (session_id,),
         )
@@ -390,8 +417,11 @@ class SQLiteCacheBackend(CacheServiceBackend):
             return {"status": "unhealthy", "error": "Internal error"}, 500
 
     def delete_all(self, session_id: str) -> int:
-        """Delete all cache entries. Returns count of deleted rows."""
-        if not self._check_session(session_id):
+        """Delete all cache entries. Returns count of deleted rows.
+
+        Requires write/admin, matching the PostgreSQL backend.
+        """
+        if not self._check_write_session(session_id):
             raise PermissionError("Unauthorized")
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -1090,7 +1120,8 @@ def main():
     logger.info(f"Starting cache service on {args.host}:{args.port}")
     if not require_auth:
         logger.info("Authentication disabled (--no-auth mode)")
-    app.run(host=args.host, port=args.port, debug=False)
+    # Production WSGI server when available; see _common.serve_app.
+    serve_app(app, args.host, args.port, "cache")
 
 
 if __name__ == "__main__":

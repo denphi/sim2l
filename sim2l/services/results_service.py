@@ -19,7 +19,7 @@ from flask import Flask, request, jsonify
 
 from ..database.run_database import RunDatabase
 from ..database.session_manager import get_session_manager, Session
-from ._common import LoginRateLimiter, client_ip as _client_ip
+from ._common import LoginRateLimiter, client_ip as _client_ip, serve_app
 
 # Review item #T15: per-(ip, username) login throttle.
 _login_limiter = LoginRateLimiter(max_attempts=5, window_seconds=60.0)
@@ -1156,6 +1156,25 @@ def create_results_service(
 
         return session
 
+    def require_privilege(session, privilege: str):
+        """Return an error response unless ``session`` carries ``privilege``.
+
+        ``check_session`` only established that the session exists and hasn't
+        expired, so destructive routes were reachable by any authenticated
+        account — a ``role="user"`` session holding just ``["read", "write"]``
+        could clear every stored result. The catalog service already gates its
+        equivalent on a named privilege; this brings results into line.
+
+        Returns ``None`` when allowed. ``session`` is ``None`` in ``--no-auth``
+        mode, which stays permissive by design.
+        """
+        if session is None:
+            return None
+        privileges = getattr(session, 'privileges', None) or set()
+        if privilege in privileges or 'admin' in privileges:
+            return None
+        return jsonify({'error': 'Insufficient privileges'}), 403
+
     @app.route('/health', methods=['GET'])
     def health():
         """Health check endpoint."""
@@ -1513,6 +1532,9 @@ def create_results_service(
         auth_result = check_session()
         if isinstance(auth_result, tuple):
             return auth_result
+        denied = require_privilege(auth_result, 'write')
+        if denied is not None:
+            return denied
 
         try:
             # Single backend call → single DB transaction. Review item #R5.
@@ -1582,7 +1604,8 @@ def main():
     logger.info(f"Starting Results Service on {args.host}:{args.port}")
     logger.info(f"Backend: {args.backend}")
 
-    app.run(host=args.host, port=args.port, debug=False)
+    # Production WSGI server when available; see _common.serve_app.
+    serve_app(app, args.host, args.port, "results")
 
 
 if __name__ == '__main__':

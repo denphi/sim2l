@@ -13,6 +13,7 @@ beginnings of a consolidated base; callers gradually migrate to it.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import defaultdict, deque
@@ -52,11 +53,18 @@ class LoginRateLimiter:
     dev-loop targets.
     """
 
-    def __init__(self, max_attempts: int = 5, window_seconds: float = 60.0):
+    def __init__(
+        self,
+        max_attempts: int = 5,
+        window_seconds: float = 60.0,
+        sweep_every: int = 256,
+    ):
         self.max_attempts = max_attempts
         self.window_seconds = float(window_seconds)
         self._buckets: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
+        self._sweep_every = max(1, int(sweep_every))
+        self._calls_since_sweep = 0
 
     def _key(self, ip: Optional[str], username: Optional[str]) -> Tuple[str, str]:
         return (ip or "unknown", (username or "").lower())
@@ -67,11 +75,18 @@ class LoginRateLimiter:
         Each call records a timestamp regardless of outcome — limiting on
         attempt rate (rather than failures only) means a sustained guess
         spree still gets rejected even if the attacker rotates usernames.
+
+        Buckets that fall empty are dropped, and every so often the whole map is
+        swept. Without that the ``defaultdict`` grew one permanent entry per
+        distinct (ip, username) ever seen — 50,001 retained after 50,000
+        addresses in a 60 ms window — which is unbounded memory driven from an
+        unauthenticated endpoint.
         """
         now = time.monotonic()
         cutoff = now - self.window_seconds
         key = self._key(ip, username)
         with self._lock:
+            self._maybe_sweep(cutoff)
             bucket = self._buckets[key]
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
@@ -79,6 +94,24 @@ class LoginRateLimiter:
                 return False
             bucket.append(now)
             return True
+
+    def _maybe_sweep(self, cutoff: float) -> None:
+        """Drop fully-expired buckets. Caller must hold ``self._lock``.
+
+        Amortised: a full pass every ``_sweep_every`` calls keeps this O(1) per
+        request on average, and the map can only hold keys seen within roughly
+        the last window plus one sweep interval.
+        """
+        self._calls_since_sweep += 1
+        if self._calls_since_sweep < self._sweep_every:
+            return
+        self._calls_since_sweep = 0
+        stale = [
+            key for key, bucket in self._buckets.items()
+            if not bucket or bucket[-1] < cutoff
+        ]
+        for key in stale:
+            del self._buckets[key]
 
     def reset(self, ip: Optional[str] = None, username: Optional[str] = None) -> None:
         """Clear a bucket — used by tests and on successful logins."""
@@ -89,17 +122,43 @@ class LoginRateLimiter:
                 self._buckets.pop(self._key(ip, username), None)
 
 
-def client_ip(request) -> str:
-    """Best-effort client IP from a Flask request.
+def _trusted_proxies() -> frozenset:
+    """Peer addresses whose ``X-Forwarded-For`` we believe.
 
-    Prefers ``X-Forwarded-For`` (first hop) so deployments behind a known
-    reverse proxy get the real client; falls back to ``remote_addr``.
-    Operators who don't trust the header should strip it at the proxy.
+    Read from ``SIM2L_TRUSTED_PROXIES`` (comma-separated). Empty by default:
+    the bundled ``start_services.sh`` and Docker compose put nothing in front of
+    these services, so with no configuration there is no proxy to trust.
     """
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd:
-        return fwd.split(",", 1)[0].strip()
-    return request.remote_addr or "unknown"
+    raw = os.environ.get("SIM2L_TRUSTED_PROXIES", "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def client_ip(request) -> str:
+    """Identify the client for rate limiting.
+
+    ``X-Forwarded-For`` is honoured **only** when the immediate peer is listed in
+    ``SIM2L_TRUSTED_PROXIES``; otherwise the header is attacker-controlled and
+    the peer address is the only trustworthy identity.
+
+    This used to prefer the header unconditionally, which handed anyone a way to
+    opt out of :class:`LoginRateLimiter` entirely: a fresh
+    ``X-Forwarded-For`` per request lands in a fresh bucket, so the limiter added
+    for review item #T15 allowed unlimited credential guesses (measured: 200 of
+    200 attempts accepted while rotating the header, versus 5 of 20 from a fixed
+    address). Rate limiting is only meaningful when keyed on something the
+    client cannot choose.
+    """
+    peer = request.remote_addr or "unknown"
+    trusted = _trusted_proxies()
+    if peer in trusted:
+        fwd = request.headers.get("X-Forwarded-For")
+        if fwd:
+            # Right-most untrusted hop: walk from the end past our own proxies.
+            hops = [h.strip() for h in fwd.split(",") if h.strip()]
+            for hop in reversed(hops):
+                if hop not in trusted:
+                    return hop
+    return peer
 
 
 # ── Auth header parsing ──────────────────────────────────────────────────────
@@ -123,6 +182,49 @@ def extract_session_id(
     if require_auth and not session_id:
         return None, ({"error": "Missing session ID"}, 401)
     return session_id or demo_session, None
+
+
+# ── Serving ──────────────────────────────────────────────────────────────────
+
+
+def serve_app(app, host: str, port: int, service_name: str) -> None:
+    """Serve a service app on a production WSGI server when one is available.
+
+    All three services ended in ``app.run(...)``, and the Docker images invoke
+    exactly that — so the Flask *development* server was the production server.
+    Werkzeug's own documentation says not to do this: no worker recycling, no
+    graceful restart, no request limits, and a debug-oriented error path.
+
+    Waitress is used when installed (pure Python, so it needs no toolchain in a
+    slim image and behaves the same on macOS/Windows for local development).
+    Without it we fall back to ``app.run`` and say so loudly rather than failing
+    to start — a developer who has not installed the prod extras should still be
+    able to run the service.
+
+    ``threads`` is set explicitly rather than inherited: the executors these
+    services call are themselves process-spawning and the notebook path
+    serializes on an environment lock, so a very wide thread pool buys little.
+    """
+    threads = int(os.environ.get("SIM2L_SERVER_THREADS", "8"))
+    try:
+        from waitress import serve as _waitress_serve
+    except ImportError:
+        logger = __import__("logging").getLogger(__name__)
+        logger.warning(
+            "waitress is not installed — falling back to the Flask development "
+            "server for %s. This is fine for local development and unsuitable "
+            "for deployment; install it with `pip install waitress` (it is in "
+            "requirements/prod.txt).",
+            service_name,
+        )
+        app.run(host=host, port=port, debug=False)
+        return
+
+    __import__("logging").getLogger(__name__).info(
+        "Serving %s on http://%s:%s via waitress (%d threads)",
+        service_name, host, port, threads,
+    )
+    _waitress_serve(app, host=host, port=port, threads=threads)
 
 
 # ── PostgreSQL-to-SQLite schema adapter ──────────────────────────────────────

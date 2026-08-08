@@ -6,7 +6,7 @@ services:
     image: postgres:15
     environment:
       POSTGRES_USER: sim2l
-      POSTGRES_PASSWORD: sim2l_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in docker/.env}
       POSTGRES_DB: sim2l
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -48,7 +48,7 @@ services:
       dockerfile: docker/Dockerfile.cache
     environment:
       BACKEND: postgresql
-      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_cache
+      DB_URL: postgresql://sim2l:${POSTGRES_PASSWORD}@postgres:5432/sim2l_cache
       HOST: 0.0.0.0
       PORT: 8001
     ports:
@@ -93,7 +93,7 @@ services:
       dockerfile: docker/Dockerfile.catalog
     environment:
       BACKEND: postgresql
-      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_catalog
+      DB_URL: postgresql://sim2l:${POSTGRES_PASSWORD}@postgres:5432/sim2l_catalog
       HOST: 0.0.0.0
       PORT: 8002
     ports:
@@ -138,7 +138,7 @@ services:
       dockerfile: docker/Dockerfile.results
     environment:
       BACKEND: postgresql
-      DB_URL: postgresql://sim2l:sim2l_password@postgres:5432/sim2l_results
+      DB_URL: postgresql://sim2l:${POSTGRES_PASSWORD}@postgres:5432/sim2l_results
       HOST: 0.0.0.0
       PORT: 8003
     ports:

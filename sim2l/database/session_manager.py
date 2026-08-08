@@ -175,6 +175,11 @@ class SessionManager:
         self._users: Dict[int, Dict[str, Any]] = {}
         self._username_to_id: Dict[str, int] = {}
         self._next_user_id = 1
+        # Built on first use by _dummy_hash(); keeps authenticate() constant-cost
+        # for unknown usernames without paying a bcrypt round on construction.
+        self._dummy_password_hash: Optional[bytes] = None
+        # Cheap counter so session creation amortises expiry cleanup.
+        self._logins_since_sweep = 0
 
         # Create default admin user (password chosen by environment/dev-mode)
         self._create_default_admin()
@@ -267,6 +272,17 @@ class SessionManager:
         """Hash a password using bcrypt with a random salt."""
         return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
+    def _dummy_hash(self) -> bytes:
+        """A throwaway bcrypt hash to verify against when the user is unknown.
+
+        Computed once, lazily, at the same cost factor as a real hash, so
+        :meth:`authenticate` performs identical work whether or not the username
+        exists. See the comment there for why that matters.
+        """
+        if self._dummy_password_hash is None:
+            self._dummy_password_hash = self._hash_password(secrets.token_urlsafe(32))
+        return self._dummy_password_hash
+
     def _verify_password(self, password: str, hashed) -> bool:
         """Verify a password against a bcrypt hash."""
         if isinstance(hashed, str):
@@ -322,13 +338,20 @@ class SessionManager:
         Raises:
             ValueError: If authentication fails
         """
+        # Always run one bcrypt verify, whether or not the username exists.
+        #
+        # Returning early on an unknown user leaked which usernames are real:
+        # bcrypt's cost factor — the thing protecting the password — made the
+        # two paths trivially distinguishable (measured 203 ms for an existing
+        # user versus 0.000 ms for an unknown one). The error message was
+        # already identical; the timing was not. Verifying against a throwaway
+        # hash costs the same as the real check and closes the oracle.
         user_id = self._username_to_id.get(username)
-        if user_id is None:
-            raise ValueError("Invalid username or password")
+        user = self._users.get(user_id) if user_id is not None else None
+        expected_hash = user["password_hash"] if user else self._dummy_hash()
+        password_ok = self._verify_password(password, expected_hash)
 
-        user = self._users[user_id]
-
-        if not self._verify_password(password, user["password_hash"]):
+        if user is None or not password_ok:
             raise ValueError("Invalid username or password")
 
         # Determine privileges based on role
@@ -354,6 +377,16 @@ class SessionManager:
         )
 
         self._sessions[session_id] = session
+
+        # Amortise expiry cleanup onto session creation. cleanup_expired_sessions
+        # was correct but its only non-test caller was list_sessions(), and
+        # get_session() only evicts a session someone happens to look up — so
+        # sessions never touched again (an abandoned login, the common case) were
+        # retained for the process lifetime.
+        self._logins_since_sweep += 1
+        if self._logins_since_sweep >= 64:
+            self._logins_since_sweep = 0
+            self.cleanup_expired_sessions()
 
         logger.info(
             f"User {username} authenticated (Session: {session_id[:8]}..., "

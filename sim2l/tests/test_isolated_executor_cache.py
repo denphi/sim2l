@@ -183,3 +183,62 @@ def test_store_cache_service_skipped_when_unconfigured(monkeypatch):
     )
     ex = IsolatedFunctionExecutor(cache=True)
     ex._store_cache_service(result, {})
+
+
+def test_load_result_with_fallback_uses_results_service(monkeypatch):
+    """A cache hit produced on another installation has no local DB row —
+    the loader reconstructs the result from the results service."""
+    import sim2l.config as cfg
+    from sim2l.result import result as result_mod
+
+    monkeypatch.setattr(
+        cfg, "get_config",
+        lambda: SimpleNamespace(
+            results_service_url="http://localhost:8003",
+            results_session_id="rs-1",
+        ),
+    )
+    # also patch the module-level import used inside result.py
+    import sim2l.result.result as rr
+    monkeypatch.setattr(
+        rr, "load_result",
+        lambda eid, db_path=None: (_ for _ in ()).throw(ValueError("no local row")),
+    )
+
+    service_row = {
+        "execution_id": "exec-remote",
+        "simulation_name": "demo",
+        "simulation_version": "0.1.0",
+        "squid_id": "sq-remote",
+        "input_params": {"x": 1.0},
+        "output_params": {"y": 2.0, "label": "ok"},
+        "status": "completed",
+        "duration_seconds": 0.7,
+    }
+
+    client = MagicMock()
+    client.get_result.return_value = service_row
+    import sim2l.database.results_client as rc_mod
+    monkeypatch.setattr(rc_mod, "ResultsClient", lambda **kw: client)
+
+    out = rr.load_result_with_fallback("exec-remote")
+    assert out.execution_id == "exec-remote"
+    assert out.simulation_name == "demo"
+    assert out.outputs.y == 2.0
+    assert out.outputs.label == "ok"
+    assert out.status == "completed"
+    assert out.executor_type == "results-service"
+
+
+def test_load_result_with_fallback_reraises_without_service(monkeypatch):
+    """No results service configured → the local error propagates."""
+    import sim2l.config as cfg
+    import sim2l.result.result as rr
+
+    monkeypatch.setattr(cfg, "get_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        rr, "load_result",
+        lambda eid, db_path=None: (_ for _ in ()).throw(ValueError("no local row")),
+    )
+    with pytest.raises(ValueError, match="no local row"):
+        rr.load_result_with_fallback("exec-x")

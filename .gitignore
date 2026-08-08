@@ -97,3 +97,6 @@ web-ui/.env
 web-ui/.env.local
 web-ui/.env.*.local
 web-ui/package-lock.json
+
+# Compose secrets. docker/.env.example is tracked and carries no values.
+docker/.env

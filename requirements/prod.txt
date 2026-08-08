@@ -14,3 +14,8 @@ sqlalchemy
 flask
 requests
 psycopg2-binary
+# Production WSGI server for the cache/catalog/results services. Pure Python,
+# so it needs no build toolchain in the slim images and behaves the same on
+# macOS/Windows for local development. Without it the services fall back to the
+# Flask development server with a warning (see sim2l/services/_common.serve_app).
+waitress

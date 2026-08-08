@@ -34,6 +34,7 @@ from sim2l.services._common import (
     adapt_postgres_schema_for_sqlite as _adapt_postgres_schema_for_sqlite,
     client_ip as _client_ip,
     extract_session_id as _extract_session_id,
+    serve_app,
     utcnow as _utcnow,
 )
 
@@ -239,6 +240,66 @@ def _normalize_workflow_bundle(payload: dict) -> Optional[dict]:
     }
 
 
+def _search_tokens(query: Optional[str]) -> list[str]:
+    """Split a free-text catalog query into distinct lowercase keywords.
+
+    The ARC searcher sends a space-joined keyword string (e.g.
+    ``"band gap prediction dft"``). Matching that whole phrase as one
+    ``LIKE %band gap prediction dft%`` against ``name`` alone essentially
+    never hits. We tokenize instead and OR the tokens across several
+    columns so any keyword overlap surfaces a candidate. Tokens of one
+    char are dropped (too noisy); duplicates are collapsed but order is
+    preserved for deterministic SQL.
+    """
+    if not query:
+        return []
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for raw in str(query).lower().split():
+        tok = raw.strip()
+        if len(tok) < 2 or tok in seen:
+            continue
+        seen.add(tok)
+        tokens.append(tok)
+    return tokens
+
+
+def _keyword_search_sql(tokens: list[str], like_op: str, placeholder: str):
+    """Build the recall WHERE fragment + match-count ORDER expression.
+
+    Returns ``(where_fragment, order_expr, params)``. Each token is matched
+    (case-insensitively, via ``like_op`` = ``LIKE``/``ILIKE``) against
+    ``name``, ``description``, and the JSON-encoded ``tags`` column; a row
+    qualifies if *any* token matches *any* column (recall). ``order_expr``
+    sums a per-token CASE so rows matching more keywords rank first
+    (precision-ish ordering), with ``created_at`` as the tiebreaker added by
+    the caller. ``placeholder`` is ``?`` (SQLite) or ``%s`` (Postgres).
+
+    The same ``params`` value (``%token%``) is shared by the WHERE clause
+    and the ORDER CASE for each token, so the caller passes ``params``
+    twice — once for each fragment — in column order.
+    """
+    if not tokens:
+        return "", "", []
+    columns = ("name", "description", "tags")
+    where_terms: list[str] = []
+    order_terms: list[str] = []
+    params: list[str] = []
+    for tok in tokens:
+        like = f"%{tok}%"
+        col_terms = [f"COALESCE({col}, '') {like_op} {placeholder}" for col in columns]
+        where_terms.append("(" + " OR ".join(col_terms) + ")")
+        # One CASE per token: +1 if the token matches any column.
+        order_terms.append(
+            "CASE WHEN " + " OR ".join(col_terms) + f" THEN 1 ELSE 0 END"
+        )
+        # params for this token appear once per column.
+        params.extend([like] * len(columns))
+    where_fragment = "(" + " OR ".join(where_terms) + ")"
+    order_expr = " + ".join(order_terms)
+    return where_fragment, order_expr, params
+
+
 def _normalize_schema(schema_value, field_name: str) -> Optional[dict]:
     if schema_value is None:
         return None
@@ -331,7 +392,7 @@ def _simulation_from_catalog_record(record: dict) -> SimulationDefinition:
     else:
         raise ValueError(f"Unsupported catalog workflow_type for /run: {workflow_type}")
 
-    return SimulationDefinition(
+    definition = SimulationDefinition(
         name=record["name"],
         version=record["version"],
         inputs=InputSchema.from_dict(record.get("input_schema") or {}),
@@ -343,6 +404,24 @@ def _simulation_from_catalog_record(record: dict) -> SimulationDefinition:
         dependencies=record.get("dependencies") or [],
         workflow_type=workflow_type,
     )
+    # The notebook branch materialises the bundle to a delete=False temp file
+    # because Papermill needs a real path. Record it so the caller can remove it
+    # once the run is done — nothing deleted it before, so every notebook /run
+    # left a sim2l_catalog_*.ipynb behind for the life of the host.
+    if isinstance(workflow, Path):
+        definition._sim2l_tempfile = str(workflow)
+    return definition
+
+
+def _cleanup_catalog_tempfile(sim) -> None:
+    """Remove the temp notebook materialised by ``_simulation_from_catalog_record``."""
+    path = getattr(sim, "_sim2l_tempfile", None)
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        logger.warning("Could not remove temporary workflow file %s: %s", path, exc)
 
 
 def _register_service_result(
@@ -631,9 +710,11 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
         conditions = []
         params = []
 
-        if query:
-            conditions.append("name LIKE ?")
-            params.append(f"%{query}%")
+        tokens = _search_tokens(query)
+        kw_where, kw_order, kw_params = _keyword_search_sql(tokens, "LIKE", "?")
+        if kw_where:
+            conditions.append(kw_where)
+            params.extend(kw_params)
 
         if status and status != "all":
             conditions.append("status = ?")
@@ -641,16 +722,25 @@ class SQLiteCatalogBackend(CatalogServiceBackend):
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
+        # Rank by number of matched keywords first, then recency. The match
+        # count needs the same %token% params again (once per column).
+        if kw_order:
+            order_clause = f"ORDER BY ({kw_order}) DESC, created_at DESC"
+            order_params = kw_params
+        else:
+            order_clause = "ORDER BY created_at DESC"
+            order_params = []
+
         cursor.execute(
             f"""
             SELECT id, name, version, description, author, tags, status,
                    created_at, updated_at, input_schema, output_schema
             FROM simulations
             WHERE {where_clause}
-            ORDER BY created_at DESC
+            {order_clause}
             LIMIT ?
             """,
-            params + [limit],
+            params + order_params + [limit],
         )
 
         results = []
@@ -1396,9 +1486,14 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
         conditions = []
         params = []
 
-        if query:
-            conditions.append("name ILIKE %s")
-            params.append(f"%{query}%")
+        tokens = _search_tokens(query)
+        # tags is JSONB in Postgres; cast to text so ILIKE can scan it.
+        kw_where, kw_order, kw_params = _keyword_search_sql(tokens, "ILIKE", "%s")
+        if kw_where:
+            kw_where = kw_where.replace("COALESCE(tags, '')", "COALESCE(tags::text, '')")
+            kw_order = kw_order.replace("COALESCE(tags, '')", "COALESCE(tags::text, '')")
+            conditions.append(kw_where)
+            params.extend(kw_params)
 
         if status and status != "all":
             conditions.append("status = %s")
@@ -1406,16 +1501,23 @@ class PostgreSQLCatalogBackend(CatalogServiceBackend):
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
+        if kw_order:
+            order_clause = f"ORDER BY ({kw_order}) DESC, created_at DESC"
+            order_params = kw_params
+        else:
+            order_clause = "ORDER BY created_at DESC"
+            order_params = []
+
         cursor.execute(
             f"""
             SELECT id, name, version, description, author, tags, status,
                    created_at, updated_at, input_schema, output_schema
             FROM simulations
             WHERE {where_clause}
-            ORDER BY created_at DESC
+            {order_clause}
             LIMIT %s
             """,
-            params + [limit],
+            params + order_params + [limit],
         )
 
         results = []
@@ -2278,6 +2380,10 @@ def run_simulation():
         # caller.
         logger.error("Error executing simulation %s: %s", simulation_name, e, exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        # Notebook bundles are materialised to a temp file for Papermill; drop
+        # it whether the run succeeded, failed, or raised.
+        _cleanup_catalog_tempfile(sim)
 
 
 @app.route("/simulations/<int:simulation_id>/stats", methods=["GET"])
@@ -2367,7 +2473,8 @@ def main():
         logger.info("Using PostgreSQL backend")
 
     logger.info(f"Starting catalog service on {args.host}:{args.port}")
-    app.run(host=args.host, port=args.port, debug=False)
+    # Production WSGI server when available; see _common.serve_app.
+    serve_app(app, args.host, args.port, "catalog")
 
 
 if __name__ == "__main__":

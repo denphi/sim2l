@@ -7,7 +7,9 @@
 import os
 import uuid
 import tempfile
+import threading
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -25,6 +27,78 @@ from ..utils.serialization import serialize_output_value as _to_value
 from ..config import get_config, get_logger
 
 logger = get_logger()
+
+
+# The identity of a run reaches the notebook through process-global environment
+# variables: the kernel Papermill spawns inherits ``os.environ``, and
+# ``sim2l.api.save_outputs`` reads ``SIM2L_EXECUTION_ID`` / ``SIM2L_DB_PATH``
+# from inside that kernel to decide which execution its outputs belong to.
+#
+# ``os.environ`` is process-wide, and the Flask services run threaded
+# (``Flask.run`` defaults ``threaded=True``). Two overlapping executions used to
+# overwrite each other's values between the set and the kernel spawn, so results
+# were written under whichever execution_id happened to be current — silently,
+# with no error and no way to tell afterwards which runs were misfiled.
+#
+# This lock serializes the set → spawn → restore window. It does mean notebook
+# executions do not overlap within a process, which is a real throughput cost on
+# long simulations; correctness of the provenance record wins. The lock could be
+# released right after the kernel starts, but Papermill exposes no hook there.
+# The lasting fix is to stop routing per-run identity through the environment —
+# inject it at kernel launch, or pass it to ``save_outputs`` explicitly — which
+# is a change to the notebook-facing contract and belongs in its own release.
+_EXECUTION_ENV_LOCK = threading.Lock()
+
+
+@contextmanager
+def _execution_environment(values: Dict[str, str]):
+    """Hold ``values`` in ``os.environ`` for the duration of the block.
+
+    Serialized against other executions in this process, and restores the
+    previous values (rather than deleting) on the way out, so a caller that had
+    these set for its own reasons gets them back. The restore runs even when the
+    body raises — the old code cleared them on the success path only, so a
+    notebook that failed left its execution id set for whatever ran next.
+    """
+    with _EXECUTION_ENV_LOCK:
+        previous = {key: os.environ.get(key) for key in values}
+        os.environ.update(values)
+        try:
+            yield
+        finally:
+            for key, was in previous.items():
+                if was is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = was
+
+
+def _notebook_timeouts() -> Dict[str, Any]:
+    """Execution/startup timeouts for Papermill, in seconds.
+
+    Mirrors ``SIM2L_FUNCTION_EXEC_TIMEOUT`` on the function executor so both
+    execution paths reachable from ``/simulations/<id>/execute`` are bounded.
+    Without this a notebook that loops forever, blocks on input, or stalls on a
+    network read held its worker thread indefinitely.
+
+    ``SIM2L_NOTEBOOK_EXEC_TIMEOUT=0`` disables the execution cap for the genuinely
+    long-running solves this library exists to run; startup stays bounded.
+    """
+    raw = os.getenv("SIM2L_NOTEBOOK_EXEC_TIMEOUT", "3600")
+    try:
+        execution_timeout: Optional[float] = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid SIM2L_NOTEBOOK_EXEC_TIMEOUT=%r; using 3600s", raw)
+        execution_timeout = 3600.0
+    if execution_timeout is not None and execution_timeout <= 0:
+        execution_timeout = None  # explicitly unbounded
+
+    try:
+        start_timeout = float(os.getenv("SIM2L_NOTEBOOK_START_TIMEOUT", "60"))
+    except (TypeError, ValueError):
+        start_timeout = 60.0
+
+    return {"execution_timeout": execution_timeout, "start_timeout": start_timeout}
 
 
 class NotebookExecutor(Executor):
@@ -278,27 +352,25 @@ class NotebookExecutor(Executor):
             # Convert DB path to absolute path
             db_path = Path(get_config().db_path).resolve()
 
-            # NOTE: os.environ is process-wide and NOT thread-safe.
-            # If two NotebookExecutor.execute() calls run concurrently in the
-            # same process (e.g. via threading), these env vars may race.
-            # Papermill itself spawns a subprocess so the env is forked safely,
-            # but the set/clear window here is not protected by a lock.
-            os.environ['SIM2L_EXECUTION_ID'] = result.execution_id
-            os.environ['SIM2L_SQUID_ID'] = squid_id
-            os.environ['SIM2L_DB_PATH'] = str(db_path)
-
-            # Execute with Papermill
-            pm.execute_notebook(
-                input_path=str(notebook_path),
-                output_path=str(output_notebook),
-                parameters=papermill_params,
-                cwd=str(outdir),
-            )
-
-            # Clean up environment variables
-            os.environ.pop('SIM2L_EXECUTION_ID', None)
-            os.environ.pop('SIM2L_SQUID_ID', None)
-            os.environ.pop('SIM2L_DB_PATH', None)
+            # The kernel Papermill spawns inherits os.environ, which is how
+            # save_outputs() learns which execution it is writing for. That
+            # window is serialized and restored by _execution_environment —
+            # see the comment on _EXECUTION_ENV_LOCK for why.
+            timeouts = _notebook_timeouts()
+            with _execution_environment({
+                'SIM2L_EXECUTION_ID': result.execution_id,
+                'SIM2L_SQUID_ID': squid_id,
+                'SIM2L_DB_PATH': str(db_path),
+            }):
+                pm.execute_notebook(
+                    input_path=str(notebook_path),
+                    output_path=str(output_notebook),
+                    parameters=papermill_params,
+                    cwd=str(outdir),
+                    start_timeout=timeouts["start_timeout"],
+                    # Forwarded to nbclient as a per-cell execution cap.
+                    execution_timeout=timeouts["execution_timeout"],
+                )
 
             # Calculate duration
             duration = time.time() - start_time
